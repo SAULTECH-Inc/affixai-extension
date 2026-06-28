@@ -1,6 +1,7 @@
 {
   "name": "affixai-extension",
   "version": "1.0.0",
+  "type": "module",
   "description": "AffixAI Chrome Extension — auto-fill online forms from your AffixAI vault",
   "private": true,
   "scripts": {

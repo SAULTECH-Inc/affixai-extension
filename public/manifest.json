@@ -3,7 +3,7 @@
   "name": "AffixAI — Auto-fill forms",
   "short_name": "AffixAI",
   "version": "1.0.0",
-  "description": "Instantly fill any online form with your encrypted AffixAI vault data. Precise, intelligent field matching.",
+  "description": "Fill online forms instantly from your AffixAI vault. Intelligent field matching by name, label, and autocomplete. Sign pending documents in one click.",
   "icons": {
     "16":  "icons/icon16.png",
     "48":  "icons/icon48.png",
@@ -36,8 +36,7 @@
     "tabs"
   ],
   "host_permissions": [
-    "https://affixai-backend.vercel.app/*",
-    "http://localhost:8000/*"
+    "https://affixai-backend.vercel.app/*"
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
