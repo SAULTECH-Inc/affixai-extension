@@ -3,7 +3,7 @@
   "name": "AffixAI — Auto-fill forms",
   "short_name": "AffixAI",
   "version": "1.0.0",
-  "description": "Fill online forms instantly from your AffixAI vault. Intelligent field matching by name, label, and autocomplete. Sign pending documents in one click.",
+  "description": "Auto-fill online forms from your AffixAI vault. Smart field matching by name, label and autocomplete. Sign documents in one click.",
   "icons": {
     "16":  "icons/icon16.png",
     "48":  "icons/icon48.png",
