@@ -4,15 +4,23 @@
  * without CORS pre-flight complications).
  */
 
-const API_BASE =
-  process.env.VITE_API_URL || 'https://affixai-backend.vercel.app/api/v1';
+const API_BASE: string =
+  (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_URL) ||
+  'https://affixai-backend.vercel.app/api/v1';
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'FETCH_VAULT') {
     handleFetchVault().then(sendResponse).catch((err) =>
       sendResponse({ error: err.message })
     );
-    return true; // keep message channel open for async response
+    return true;
+  }
+
+  if (msg.type === 'FETCH_PENDING_DOCS') {
+    handleFetchPendingDocs().then(sendResponse).catch((err) =>
+      sendResponse({ error: err.message })
+    );
+    return true;
   }
 
   if (msg.type === 'SAVE_TOKEN') {
@@ -49,15 +57,28 @@ async function handleFetchVault(): Promise<Record<string, any>> {
   const token = await getToken();
   if (!token) throw new Error('Not authenticated');
 
-  // Fetch the full vault flat-map: every field value the user has stored.
   const res = await fetch(`${API_BASE}/data-vault/flat`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (res.status === 401) {
-    // Token expired — clear it so the popup prompts re-login.
     await chrome.storage.local.remove('affixai_token');
     throw new Error('Session expired. Please sign in again.');
   }
   if (!res.ok) throw new Error(`Vault fetch failed: ${res.status}`);
+  return res.json();
+}
+
+async function handleFetchPendingDocs(): Promise<any[]> {
+  const token = await getToken();
+  if (!token) throw new Error('Not authenticated');
+
+  const res = await fetch(`${API_BASE}/documents/pending-mine`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 401) {
+    await chrome.storage.local.remove('affixai_token');
+    throw new Error('Session expired. Please sign in again.');
+  }
+  if (!res.ok) throw new Error(`Failed to fetch pending documents: ${res.status}`);
   return res.json();
 }

@@ -134,7 +134,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   ).filter(
     (f) =>
       !f.disabled &&
-      !f.readOnly &&
+      !('readOnly' in f && f.readOnly) &&
       f.offsetParent !== null // visible check
   );
 
