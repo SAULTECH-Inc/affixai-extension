@@ -1,0 +1,58 @@
+name: Publish to Chrome Web Store
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Only run when extension source actually changes — skip docs/asset-only pushes
+      - 'src/**'
+      - 'public/**'
+      - 'package.json'
+      - 'vite.config.ts'
+      - 'tsconfig.json'
+
+  # Allow manual trigger from the Actions tab (useful for forced re-publish)
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Build & publish extension
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build extension
+        run: npm run build
+
+      - name: Zip dist/
+        run: |
+          cd dist
+          zip -r ../extension.zip .
+          cd ..
+          echo "Zip size: $(du -sh extension.zip | cut -f1)"
+
+      - name: Upload & publish to Chrome Web Store
+        run: |
+          npx chrome-webstore-upload-cli@3 upload \
+            --source extension.zip \
+            --extension-id "$CHROME_EXTENSION_ID" \
+            --client-id "$CHROME_CLIENT_ID" \
+            --client-secret "$CHROME_CLIENT_SECRET" \
+            --refresh-token "$CHROME_REFRESH_TOKEN" \
+            --auto-publish
+        env:
+          CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          CHROME_CLIENT_ID:     ${{ secrets.CHROME_CLIENT_ID }}
+          CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
+          CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
