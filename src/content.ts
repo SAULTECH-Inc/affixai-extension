@@ -322,9 +322,14 @@ function injectPdfToolbox(): void {
 
   const host = document.createElement('div');
   host.id = 'affixai-tb';
+  // Start vertically centered; drag will replace top with px value
   Object.assign(host.style, {
-    position: 'fixed', top: '50%', right: '0',
-    transform: 'translateY(-50%)', zIndex: '2147483647',
+    position: 'fixed',
+    top: '50%',
+    right: '0',
+    transform: 'translateY(-50%)',
+    zIndex: '2147483647',
+    userSelect: 'none',
   });
 
   const shadow = host.attachShadow({ mode: 'open' });
@@ -332,85 +337,142 @@ function injectPdfToolbox(): void {
   document.documentElement.appendChild(host);
 
   const panel = shadow.getElementById('panel')!;
-  const st = shadow.getElementById('st')!;
-  const b1 = shadow.getElementById('b1') as HTMLButtonElement;
-  const b2 = shadow.getElementById('b2') as HTMLButtonElement;
-  const b3 = shadow.getElementById('b3') as HTMLButtonElement;
-  let open = true;
+  const tab   = shadow.getElementById('tab')!;
+  const st    = shadow.getElementById('st')!;
+  const b1    = shadow.getElementById('b1') as HTMLButtonElement;
+  const b2    = shadow.getElementById('b2') as HTMLButtonElement;
+  const b3    = shadow.getElementById('b3') as HTMLButtonElement;
+  let open    = true;
 
-  shadow.getElementById('tab')!.addEventListener('click', () => {
-    open = !open;
-    panel.classList.toggle('closed', !open);
+  // ---- Drag the toolbox (tab is the drag handle) ---------------------------
+  // If the user moves > 5px it's a drag; otherwise it's a click (toggle).
+  tab.addEventListener('mousedown', (e: MouseEvent) => {
+    const startX = e.clientX;
+    const startY = e.clientY;
+    // Capture the current pixel top before clearing the CSS transform
+    const rect = host.getBoundingClientRect();
+    let currentTop = rect.top;
+    let didDrag = false;
+
+    const onMove = (ev: MouseEvent) => {
+      const dy = ev.clientY - startY;
+      const dx = ev.clientX - startX;
+      if (!didDrag && Math.abs(dy) < 5 && Math.abs(dx) < 5) return;
+      if (!didDrag) {
+        // First real move — lock top to pixels so transform doesn't interfere
+        didDrag = true;
+        host.style.transform = 'none';
+        host.style.top = `${currentTop}px`;
+      }
+      const newTop = Math.max(0, Math.min(window.innerHeight - host.offsetHeight, currentTop + dy));
+      host.style.top = `${newTop}px`;
+    };
+
+    const onUp = (ev: MouseEvent) => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      if (!didDrag) {
+        // It was a click — toggle the panel
+        open = !open;
+        panel.classList.toggle('closed', !open);
+      }
+    };
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
   });
 
-  function status(msg: string, cls: string) {
+  // ---- Status & busy helpers -----------------------------------------------
+  function setStatus(msg: string, cls: string) {
     st.className = `st on ${cls}`;
     st.innerHTML = cls === 'ld' ? `<span class="spin"></span>${msg}` : msg;
   }
   function clearSt() { st.className = 'st'; st.textContent = ''; }
-  function busy(v: boolean) { b1.disabled = v; b2.disabled = v; }
+  function busy(v: boolean) { b1.disabled = v; b2.disabled = v; b3.disabled = v; }
 
+  // ---- Safe sendMessage — handles idle service worker ----------------------
+  async function send(msg: Record<string, unknown>): Promise<any> {
+    return new Promise((resolve, reject) => {
+      try {
+        chrome.runtime.sendMessage(msg, (response) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+          } else {
+            resolve(response);
+          }
+        });
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  // ---- Button handlers -----------------------------------------------------
   async function run(mode: 'edit' | 'auto') {
-    const auth: any = await chrome.runtime.sendMessage({ type: 'GET_AUTH_STATE' });
-    if (!auth?.authenticated) {
-      status('Sign in to AffixAI first — click the ✦ extension icon in the toolbar.', 'nf');
-      return;
-    }
-
     busy(true);
-    status('Reading PDF…', 'ld');
+    setStatus('Checking sign-in…', 'ld');
     try {
+      const auth = await send({ type: 'GET_AUTH_STATE' });
+      if (!auth?.authenticated) {
+        setStatus('Sign in to AffixAI first — click the ✦ icon in the toolbar.', 'nf');
+        busy(false);
+        return;
+      }
+      setStatus('Reading PDF…', 'ld');
       const base64 = await fetchPdfBase64();
-      status('Uploading to Affix AI…', 'ld');
-      const res: any = await chrome.runtime.sendMessage({
-        type: 'UPLOAD_PDF_BYTES', base64, filename: getPdfFilename(),
-      });
+      setStatus('Uploading…', 'ld');
+      const res = await send({ type: 'UPLOAD_PDF_BYTES', base64, filename: getPdfFilename() });
       if (res?.error) throw new Error(res.error);
       const id = res?.document_id || res?.id;
-      if (!id) throw new Error('No document ID returned from upload');
+      if (!id) throw new Error('Upload returned no document ID');
 
       const url = mode === 'auto'
         ? `https://affix-ai.com/auto-sign?doc=${id}`
         : `${PDF_EDITOR_BASE}/${id}/edit`;
 
-      status('Opened in Affix AI ✓', 'ok');
-      setTimeout(clearSt, 3500);
+      setStatus('Opened in Affix AI ✓', 'ok');
+      setTimeout(clearSt, 3000);
       busy(false);
-      await chrome.runtime.sendMessage({ type: 'OPEN_TAB', url });
+      await send({ type: 'OPEN_TAB', url });
     } catch (err: any) {
-      const msg = err.message?.includes('Failed to fetch')
-        ? 'Cannot read this file. For local PDFs, enable "Allow access to file URLs" in Chrome → Extensions → AffixAI.'
-        : (err.message || 'Something went wrong.');
-      status(msg, 'er');
+      const m = (err.message || '');
+      setStatus(
+        m.includes('Failed to fetch') || m.includes('file')
+          ? 'Cannot read this PDF. For local files enable "Allow access to file URLs" in Chrome → Extensions → AffixAI.'
+          : m || 'Something went wrong.',
+        'er'
+      );
       busy(false);
     }
   }
 
   async function openSigningOverlay() {
-    const auth: any = await chrome.runtime.sendMessage({ type: 'GET_AUTH_STATE' });
-    if (!auth?.authenticated) {
-      status('Sign in to AffixAI first — click the ✦ extension icon in the toolbar.', 'nf');
-      return;
-    }
     busy(true);
-    status('Reading PDF…', 'ld');
+    setStatus('Checking sign-in…', 'ld');
     try {
+      const auth = await send({ type: 'GET_AUTH_STATE' });
+      if (!auth?.authenticated) {
+        setStatus('Sign in to AffixAI first — click the ✦ icon in the toolbar.', 'nf');
+        busy(false);
+        return;
+      }
+      setStatus('Reading PDF…', 'ld');
       const base64 = await fetchPdfBase64();
-      const filename = getPdfFilename();
-      // Store bytes in session storage so the signing page can read them
       await chrome.storage.session.set({
         affixai_signing_pdf: base64,
-        affixai_signing_name: filename,
+        affixai_signing_name: getPdfFilename(),
       });
       clearSt();
       busy(false);
-      // Inject full-screen iframe overlay
       injectSigningIframe();
     } catch (err: any) {
-      const msg = err.message?.includes('Failed to fetch')
-        ? 'Cannot read this file. For local PDFs, enable "Allow access to file URLs" in Chrome → Extensions → AffixAI.'
-        : (err.message || 'Something went wrong.');
-      status(msg, 'er');
+      const m = (err.message || '');
+      setStatus(
+        m.includes('Failed to fetch') || m.includes('file')
+          ? 'Cannot read this PDF. For local files enable "Allow access to file URLs" in Chrome → Extensions → AffixAI.'
+          : m || 'Something went wrong.',
+        'er'
+      );
       busy(false);
     }
   }
