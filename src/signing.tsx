@@ -1,98 +1,180 @@
 /**
- * Inline PDF Signing Page — runs inside a full-screen iframe overlay
- * injected by the content script on PDF pages.
- *
- * Features:
- *   - Renders PDF pages with PDF.js (canvas, multi-page, scroll)
- *   - Signature drawing pad (freehand)
- *   - Text / date / initials stamp
- *   - Click anywhere on the page to place a stamp
- *   - Drag placed stamps to reposition
- *   - Delete placed stamps
- *   - Download the signed PDF (client-side via pdf-lib — no server round-trip)
+ * Signing overlay page — styled to match the dashboard's DocumentEditPage.
+ * Light theme, palette panel, click-to-arm placement, font controls on selection.
  */
 import { useState, useEffect, useRef, useCallback } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 
-// Point the worker at the copy we placed in public/
 pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL('pdf.worker.min.mjs');
 
-// ---- Types ------------------------------------------------------------------
+const API_BASE = 'https://affixai-backend.vercel.app/api/v1';
+const RENDER_WIDTH = 720;
 
-type ToolType = 'signature' | 'text' | 'date' | 'initials';
+// ─── colours matching dashboard CSS variables ────────────────────────────────
+const C = {
+  bgBase:      '#f8fafc',
+  bgInset:     '#f1f5f9',
+  bgElevated:  '#ffffff',
+  border:      '#e2e8f0',
+  borderStrong:'#cbd5e1',
+  fg:          '#0f172a',
+  fgMuted:     '#64748b',
+  fgSubtle:    '#94a3b8',
+  brand500:    '#8b5cf6',
+  brand400:    '#a78bfa',
+  brandSoft:   'rgba(139,92,246,0.08)',
+  brandGrad:   'linear-gradient(135deg,#8b5cf6,#ec4899)',
+  danger:      '#dc2626',
+  success:     '#16a34a',
+};
 
-interface Stamp {
-  id: string;
-  page: number;       // 1-indexed
-  x: number;         // pixels from left of the page canvas
-  y: number;         // pixels from top of the page canvas
-  width: number;
-  height: number;
-  type: ToolType;
-  dataUrl?: string;  // for signature/initials (PNG)
-  text?: string;     // for text/date
+const FONT_FAMILIES = [
+  { value:'helv',        label:'Helvetica',     cssFamily:'Helvetica,Arial,sans-serif',                       category:'sans' },
+  { value:'tiro',        label:'Times',          cssFamily:'"Times New Roman",Times,serif',                    category:'serif' },
+  { value:'cour',        label:'Courier',        cssFamily:'"Courier New",Courier,monospace',                  category:'mono' },
+  { value:'dancing',     label:'Dancing Script', cssFamily:'"Dancing Script","Snell Roundhand",cursive',       category:'script' },
+  { value:'great_vibes', label:'Great Vibes',    cssFamily:'"Great Vibes","Apple Chancery",cursive',           category:'calligraphy' },
+  { value:'caveat',      label:'Caveat',         cssFamily:'"Caveat","Bradley Hand","Marker Felt",cursive',    category:'handwriting' },
+  { value:'sacramento',  label:'Sacramento',     cssFamily:'"Sacramento","Snell Roundhand",cursive',           category:'signature' },
+];
+
+const COLOR_PRESETS = ['#000000','#1e3a8a','#7e22ce','#dc2626','#0f766e','#a16207'];
+
+// ─── types ───────────────────────────────────────────────────────────────────
+
+type PlacementKind = 'text'|'number'|'date'|'time'|'signature'|'initials';
+
+interface Placement {
+  id:          string;
+  kind:        PlacementKind;
+  page:        number;   // 1-based
+  x:           number;   // PDF pts
+  y:           number;   // PDF pts (from top)
+  value:       string;
+  width:       number;   // PDF pts
+  height:      number;   // PDF pts
+  fontsize:    number;
+  font_family: string;
+  bold:        boolean;
+  italic:      boolean;
+  color:       string;
 }
 
-// ---- Helpers ----------------------------------------------------------------
+interface PaletteItem {
+  id:           string;
+  label:        string;
+  kind:         PlacementKind;
+  defaultValue: string;
+  width:        number;
+  height:       number;
+}
+
+interface FontDefaults {
+  font_family: string;
+  fontsize:    number;
+  bold:        boolean;
+  italic:      boolean;
+  color:       string;
+}
+
+interface PageInfo {
+  canvas:         HTMLCanvasElement;
+  pdfWidth:       number;
+  pdfHeight:      number;
+  renderedWidth:  number;
+  renderedHeight: number;
+}
+
+const PALETTE: PaletteItem[] = [
+  { id:'ph.text',      label:'Text',      kind:'text',      defaultValue:'',  width:160, height:18 },
+  { id:'ph.number',    label:'Number',    kind:'number',    defaultValue:'',  width:80,  height:18 },
+  { id:'ph.date',      label:'Date',      kind:'date',      defaultValue:'',  width:100, height:18 },
+  { id:'ph.time',      label:'Time',      kind:'time',      defaultValue:'',  width:70,  height:18 },
+  { id:'ph.signature', label:'Signature', kind:'signature', defaultValue:'',  width:180, height:40 },
+  { id:'ph.initials',  label:'Initials',  kind:'initials',  defaultValue:'',  width:80,  height:18 },
+];
+
+const ICONS: Record<PlacementKind, string> = {
+  text:'T', number:'#', date:'📅', time:'⏰', signature:'✍', initials:'Ab',
+};
 
 function uid() { return Math.random().toString(36).slice(2); }
 
-function base64ToBytes(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+function b64toBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
 
-// ---- Component --------------------------------------------------------------
+function hexToRgb(hex: string) {
+  const m = hex.replace('#','').match(/.{2}/g) ?? ['00','00','00'];
+  return { r: parseInt(m[0],16)/255, g: parseInt(m[1],16)/255, b: parseInt(m[2],16)/255 };
+}
+
+function relPos(e: React.MouseEvent|React.TouchEvent, el: HTMLElement) {
+  const r = el.getBoundingClientRect();
+  if ('touches' in e) return { x: e.touches[0].clientX - r.left, y: e.touches[0].clientY - r.top };
+  return { x: (e as React.MouseEvent).clientX - r.left, y: (e as React.MouseEvent).clientY - r.top };
+}
+
+// ─── main component ───────────────────────────────────────────────────────────
 
 export default function SigningPage() {
-  // PDF state
-  const [pdfBytes, setPdfBytes]       = useState<Uint8Array | null>(null);
-  const [pdfDoc, setPdfDoc]           = useState<pdfjsLib.PDFDocumentProxy | null>(null);
-  const [numPages, setNumPages]       = useState(0);
-  const [filename, setFilename]       = useState('document.pdf');
-  const [pageScales, setPageScales]   = useState<number[]>([]);   // rendered scale per page
-  const [pageCanvases, setPageCanvases] = useState<HTMLCanvasElement[]>([]);
+  const [pdfBytes,   setPdfBytes]   = useState<Uint8Array|null>(null);
+  const [pdfDoc,     setPdfDoc]     = useState<pdfjsLib.PDFDocumentProxy|null>(null);
+  const [numPages,   setNumPages]   = useState(0);
+  const [filename,   setFilename]   = useState('document.pdf');
+  const [pageInfos,  setPageInfos]  = useState<PageInfo[]>([]);
 
-  // Signing state
-  const [stamps, setStamps]           = useState<Stamp[]>([]);
-  const [activeTool, setActiveTool]   = useState<ToolType>('signature');
-  const [sigDataUrl, setSigDataUrl]   = useState<string | null>(null);      // drawn signature
-  const [initDataUrl, setInitDataUrl] = useState<string | null>(null);      // drawn initials
-  const [customText, setCustomText]   = useState('');
-  const [placingMode, setPlacingMode] = useState(false);   // click-to-place active
-  const [status, setStatus]           = useState<{msg: string; type: 'ok'|'err'}|null>(null);
-  const [downloading, setDownloading] = useState(false);
+  const [placements,   setPlacements]   = useState<Placement[]>([]);
+  const [selectedIdx,  setSelectedIdx]  = useState<number|null>(null);
+  const [armedItem,    setArmedItem]    = useState<PaletteItem|null>(null);
+  const [defaults,     setDefaults]     = useState<FontDefaults>({
+    font_family:'helv', fontsize:10, bold:false, italic:false, color:'#000000',
+  });
 
-  // Signature pad
-  const sigPadRef    = useRef<HTMLCanvasElement>(null);
-  const initPadRef   = useRef<HTMLCanvasElement>(null);
-  const isDrawing    = useRef(false);
-  const lastXY       = useRef({ x: 0, y: 0 });
+  const [sigUrl,       setSigUrl]       = useState<string|null>(null);
+  const [drawingOpen,  setDrawingOpen]  = useState(false);
+  const [downloading,  setDownloading]  = useState(false);
+  const [status,       setStatus]       = useState<{msg:string;type:'ok'|'err'}|null>(null);
+  const [defaultsOpen, setDefaultsOpen] = useState(false);
 
-  // PDF containers
-  const pdfAreaRef   = useRef<HTMLDivElement>(null);
-  // page canvas refs keyed by page number
-  const canvasRefs   = useRef<Map<number, HTMLCanvasElement>>(new Map());
+  const canvasRefs   = useRef<Map<number,HTMLCanvasElement>>(new Map());
+  const pageInfosRef = useRef<PageInfo[]>([]);
+  const dragRef      = useRef<{id:string;mx:number;my:number}|null>(null);
+  const drawPadRef   = useRef<HTMLCanvasElement>(null);
+  const isDrawingRef = useRef(false);
+  const lastXYRef    = useRef({x:0,y:0});
 
-  // Drag state
-  const dragRef      = useRef<{id: string; ox: number; oy: number; mx: number; my: number}|null>(null);
+  useEffect(() => { pageInfosRef.current = pageInfos; }, [pageInfos]);
 
-  // ---- Boot — load PDF from chrome.storage.session -------------------------
+  // ── boot ──────────────────────────────────────────────────────────────────
 
   useEffect(() => {
-    chrome.storage.session.get(['affixai_signing_pdf', 'affixai_signing_name'], (res) => {
+    chrome.storage.session.get(['affixai_signing_pdf','affixai_signing_name'], (res) => {
       if (res.affixai_signing_pdf) {
-        setPdfBytes(base64ToBytes(res.affixai_signing_pdf));
+        setPdfBytes(b64toBytes(res.affixai_signing_pdf));
         setFilename(res.affixai_signing_name || 'document.pdf');
       }
     });
-    // Also accept postMessage (fallback if session storage isn't available)
+
+    chrome.storage.local.get('affixai_token', async (res) => {
+      const tok = res.affixai_token ?? null;
+      if (!tok) return;
+      try {
+        const r1 = await fetch(`${API_BASE}/signatures/default`, { headers:{ Authorization:`Bearer ${tok}` } });
+        if (!r1.ok) return;
+        const { id } = await r1.json();
+        const r2 = await fetch(`${API_BASE}/signatures/${id}/file`, { headers:{ Authorization:`Bearer ${tok}` } });
+        if (r2.ok) setSigUrl(URL.createObjectURL(await r2.blob()));
+      } catch { /* no saved sig */ }
+    });
+
     const onMsg = (e: MessageEvent) => {
       if (e.data?.type === 'AFFIXAI_PDF_DATA') {
-        setPdfBytes(base64ToBytes(e.data.base64));
+        setPdfBytes(b64toBytes(e.data.base64));
         setFilename(e.data.filename || 'document.pdf');
       }
     };
@@ -100,7 +182,15 @@ export default function SigningPage() {
     return () => window.removeEventListener('message', onMsg);
   }, []);
 
-  // ---- Parse PDF with PDF.js -----------------------------------------------
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setArmedItem(null); setDrawingOpen(false); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // ── PDF rendering ─────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!pdfBytes) return;
@@ -110,126 +200,105 @@ export default function SigningPage() {
     });
   }, [pdfBytes]);
 
-  // Render each page when pdfDoc is ready
   useEffect(() => {
     if (!pdfDoc) return;
-    const SCALE = 1.4;
-    const canvases: HTMLCanvasElement[] = [];
-    const scales: number[] = [];
-
     (async () => {
+      const infos: PageInfo[] = [];
       for (let i = 1; i <= pdfDoc.numPages; i++) {
         const page = await pdfDoc.getPage(i);
-        const vp = page.getViewport({ scale: SCALE });
-        const canvas = canvasRefs.current.get(i) || document.createElement('canvas');
-        canvas.width = vp.width;
+        const origVp = page.getViewport({ scale: 1 });
+        const scale  = RENDER_WIDTH / origVp.width;
+        const vp     = page.getViewport({ scale });
+        const canvas = document.createElement('canvas');
+        canvas.width  = vp.width;
         canvas.height = vp.height;
         canvasRefs.current.set(i, canvas);
-        const ctx = canvas.getContext('2d')!;
-        await page.render({ canvasContext: ctx, viewport: vp }).promise;
-        canvases.push(canvas);
-        scales.push(SCALE);
+        await page.render({ canvasContext: canvas.getContext('2d')!, viewport: vp }).promise;
+        infos.push({
+          canvas,
+          pdfWidth: origVp.width, pdfHeight: origVp.height,
+          renderedWidth: vp.width, renderedHeight: vp.height,
+        });
       }
-      setPageCanvases([...canvases]);
-      setPageScales([...scales]);
+      setPageInfos(infos);
     })();
   }, [pdfDoc]);
 
-  // ---- Signature pad drawing -----------------------------------------------
+  // ── placement helpers ─────────────────────────────────────────────────────
 
-  function padStart(e: React.MouseEvent | React.TouchEvent, padRef: React.RefObject<HTMLCanvasElement>) {
-    isDrawing.current = true;
-    const pos = relPos(e, padRef.current!);
-    lastXY.current = pos;
+  function buildPlacement(item: PaletteItem, page: number, xPdf: number, yPdf: number): Placement {
+    return {
+      id: uid(), kind: item.kind, page, x: xPdf, y: yPdf,
+      value: item.kind === 'date' ? new Date().toLocaleDateString()
+           : item.kind === 'time' ? new Date().toLocaleTimeString()
+           : item.defaultValue,
+      width: item.width, height: item.height,
+      fontsize:    defaults.fontsize,
+      font_family: defaults.font_family,
+      bold:        defaults.bold,
+      italic:      defaults.italic,
+      color:       defaults.color,
+    };
   }
 
-  function padMove(e: React.MouseEvent | React.TouchEvent, padRef: React.RefObject<HTMLCanvasElement>) {
-    if (!isDrawing.current) return;
-    const canvas = padRef.current!;
-    const ctx = canvas.getContext('2d')!;
-    const pos = relPos(e, canvas);
-    ctx.beginPath();
-    ctx.moveTo(lastXY.current.x, lastXY.current.y);
-    ctx.lineTo(pos.x, pos.y);
-    ctx.strokeStyle = '#1a1a2e';
-    ctx.lineWidth = 2.5;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.stroke();
-    lastXY.current = pos;
+  function handlePageClick(e: React.MouseEvent<HTMLDivElement>, idx: number) {
+    if (!armedItem) return;
+    const info = pageInfos[idx];
+    if (!info) return;
+    const rect  = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const ratio = info.pdfWidth / info.renderedWidth;
+    const xPdf  = (e.clientX - rect.left) * ratio;
+    const yPdf  = (e.clientY - rect.top)  * ratio;
+    setPlacements(prev => [...prev, buildPlacement(armedItem, idx + 1, xPdf, yPdf)]);
+    // stay armed for rapid placement
   }
 
-  function padEnd(padRef: React.RefObject<HTMLCanvasElement>, setter: (v: string) => void) {
-    isDrawing.current = false;
-    setter(padRef.current!.toDataURL());
+  function delPlacement(id: string) {
+    const idx = placements.findIndex(p => p.id === id);
+    setPlacements(prev => prev.filter(p => p.id !== id));
+    if (selectedIdx !== null && (idx === selectedIdx || selectedIdx >= placements.length - 1))
+      setSelectedIdx(null);
   }
 
-  function clearPad(padRef: React.RefObject<HTMLCanvasElement>, setter: (v: string | null) => void) {
-    const ctx = padRef.current!.getContext('2d')!;
-    ctx.clearRect(0, 0, padRef.current!.width, padRef.current!.height);
-    setter(null);
+  function updPlacement(id: string, changes: Partial<Placement>) {
+    setPlacements(prev => prev.map(p => p.id === id ? { ...p, ...changes } : p));
   }
 
-  // ---- Click-to-place on PDF pages -----------------------------------------
-
-  function handlePageClick(e: React.MouseEvent<HTMLDivElement>, pageIndex: number) {
-    if (!placingMode) return;
-    const pageNum = pageIndex + 1;
-    const canvas = canvasRefs.current.get(pageNum);
-    if (!canvas) return;
-
-    const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
-    const cx = e.clientX - rect.left;
-    const cy = e.clientY - rect.top;
-
-    // Determine what to stamp
-    let dataUrl: string | undefined;
-    let text: string | undefined;
-    let w = 160, h = 60;
-
-    if (activeTool === 'signature') {
-      if (!sigDataUrl) { setStatus({ msg: 'Draw your signature first.', type: 'err' }); return; }
-      dataUrl = sigDataUrl;
-    } else if (activeTool === 'initials') {
-      if (!initDataUrl) { setStatus({ msg: 'Draw your initials first.', type: 'err' }); return; }
-      dataUrl = initDataUrl;
-      w = 80; h = 50;
-    } else if (activeTool === 'date') {
-      text = new Date().toLocaleDateString();
-      w = 120; h = 24;
-    } else {
-      text = customText || 'Text';
-      w = Math.max(80, customText.length * 8);
-      h = 24;
-    }
-
-    setStamps(prev => [...prev, {
-      id: uid(), page: pageNum,
-      x: cx - w / 2, y: cy - h / 2,
-      width: w, height: h,
-      type: activeTool,
-      dataUrl, text,
-    }]);
-    setPlacingMode(false);
-    setStatus({ msg: 'Placed! Drag to reposition, or click ✕ to remove.', type: 'ok' });
+  function armItem(item: PaletteItem) {
+    if (armedItem?.id === item.id) { setArmedItem(null); return; }
+    if (item.kind === 'signature' && !sigUrl) { setDrawingOpen(true); return; }
+    setArmedItem(item);
+    setSelectedIdx(null);
   }
 
-  // ---- Drag to reposition stamps -------------------------------------------
+  function updateDefaults(next: FontDefaults) {
+    setDefaults(next);
+    setPlacements(prev => prev.map(p => {
+      if (['signature'].includes(p.kind)) return p;
+      return { ...p, font_family:next.font_family, fontsize:next.fontsize, bold:next.bold, italic:next.italic, color:next.color };
+    }));
+  }
 
-  const startDrag = useCallback((e: React.MouseEvent, id: string, currentX: number, currentY: number) => {
+  // ── drag ─────────────────────────────────────────────────────────────────
+
+  const startDrag = useCallback((e: React.MouseEvent, id: string) => {
     e.preventDefault();
     e.stopPropagation();
-    dragRef.current = { id, ox: currentX, oy: currentY, mx: e.clientX, my: e.clientY };
+    dragRef.current = { id, mx: e.clientX, my: e.clientY };
 
     const onMove = (ev: MouseEvent) => {
       if (!dragRef.current) return;
       const dx = ev.clientX - dragRef.current.mx;
       const dy = ev.clientY - dragRef.current.my;
-      setStamps(prev => prev.map(s =>
-        s.id === dragRef.current!.id
-          ? { ...s, x: dragRef.current!.ox + dx, y: dragRef.current!.oy + dy }
-          : s
-      ));
+      setPlacements(prev => prev.map(p => {
+        if (p.id !== dragRef.current!.id) return p;
+        const info = pageInfosRef.current[p.page - 1];
+        if (!info) return p;
+        const ratio = info.pdfWidth / info.renderedWidth;
+        return { ...p, x: p.x + dx * ratio, y: p.y + dy * ratio };
+      }));
+      dragRef.current.mx = ev.clientX;
+      dragRef.current.my = ev.clientY;
     };
     const onUp = () => {
       dragRef.current = null;
@@ -240,355 +309,605 @@ export default function SigningPage() {
     window.addEventListener('mouseup', onUp);
   }, []);
 
-  function removeStamp(id: string) {
-    setStamps(prev => prev.filter(s => s.id !== id));
+  // ── signature drawing pad ────────────────────────────────────────────────
+
+  function padStart(e: React.MouseEvent|React.TouchEvent) {
+    isDrawingRef.current = true;
+    lastXYRef.current = relPos(e, drawPadRef.current!);
+  }
+  function padMove(e: React.MouseEvent|React.TouchEvent) {
+    if (!isDrawingRef.current || !drawPadRef.current) return;
+    const ctx = drawPadRef.current.getContext('2d')!;
+    const pos = relPos(e, drawPadRef.current);
+    ctx.beginPath();
+    ctx.moveTo(lastXYRef.current.x, lastXYRef.current.y);
+    ctx.lineTo(pos.x, pos.y);
+    ctx.strokeStyle = '#0f172a'; ctx.lineWidth = 2.5;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.stroke();
+    lastXYRef.current = pos;
+  }
+  function padEnd() { isDrawingRef.current = false; }
+  function clearPad() {
+    const c = drawPadRef.current;
+    if (!c) return;
+    c.getContext('2d')!.clearRect(0, 0, c.width, c.height);
+  }
+  function saveDrawing() {
+    if (!drawPadRef.current) return;
+    setSigUrl(drawPadRef.current.toDataURL());
+    setDrawingOpen(false);
+    setArmedItem(PALETTE.find(p => p.kind === 'signature')!);
   }
 
-  // ---- Download signed PDF -------------------------------------------------
+  // ── download ─────────────────────────────────────────────────────────────
 
   async function downloadSigned() {
-    if (!pdfBytes) return;
+    if (!pdfBytes || placements.length === 0) return;
     setDownloading(true);
     setStatus(null);
     try {
-      const doc = await PDFDocument.load(pdfBytes);
-      const font = await doc.embedFont(StandardFonts.Helvetica);
+      const doc  = await PDFDocument.load(pdfBytes);
+      const helv = await doc.embedFont(StandardFonts.Helvetica);
+      const bold = await doc.embedFont(StandardFonts.HelveticaBold);
+      const tiro = await doc.embedFont(StandardFonts.TimesRoman);
+      const cour = await doc.embedFont(StandardFonts.Courier);
 
-      for (const stamp of stamps) {
-        const page = doc.getPages()[stamp.page - 1];
-        const { width: pW, height: pH } = page.getSize();
-        const canvas = canvasRefs.current.get(stamp.page);
-        if (!canvas) continue;
+      function getFont(p: Placement) {
+        if (p.font_family === 'tiro') return tiro;
+        if (p.font_family === 'cour') return cour;
+        return p.bold ? bold : helv;
+      }
 
-        // Canvas → PDF coordinate conversion
-        const scaleX = pW / canvas.width;
-        const scaleY = pH / canvas.height;
-        // PDF y=0 is bottom; canvas y=0 is top
-        const pdfX = stamp.x * scaleX;
-        const pdfY = pH - (stamp.y + stamp.height) * scaleY;
+      for (const p of placements) {
+        const pg   = doc.getPages()[p.page - 1];
+        if (!pg) continue;
+        const { height: pH } = pg.getSize();
 
-        if (stamp.dataUrl) {
-          const imgBytes = await fetch(stamp.dataUrl).then(r => r.arrayBuffer());
-          const img = await doc.embedPng(imgBytes);
-          page.drawImage(img, {
-            x: pdfX,
-            y: pdfY,
-            width: stamp.width * scaleX,
-            height: stamp.height * scaleY,
-          });
-        } else if (stamp.text) {
-          page.drawText(stamp.text, {
-            x: pdfX,
-            y: pdfY + stamp.height * scaleY * 0.25,
-            size: Math.max(8, stamp.height * scaleY * 0.6),
-            font,
-            color: rgb(0.1, 0.1, 0.1),
+        const pdfX = p.x;
+        const pdfY = pH - p.y - p.height; // flip Y (PDF origin = bottom-left)
+
+        if (p.kind === 'signature' && sigUrl) {
+          try {
+            const bytes = await fetch(sigUrl).then(r => r.arrayBuffer());
+            let img;
+            try { img = await doc.embedPng(bytes); } catch { img = await doc.embedJpg(bytes); }
+            pg.drawImage(img, { x:pdfX, y:pdfY, width:p.width, height:p.height });
+          } catch { /* skip */ }
+        } else {
+          const text = p.value || (p.kind==='date' ? new Date().toLocaleDateString() : p.kind==='time' ? new Date().toLocaleTimeString() : '');
+          if (!text) continue;
+          const c = hexToRgb(p.color);
+          pg.drawText(text, {
+            x:pdfX, y:pdfY + p.height * 0.25,
+            size:p.fontsize, font:getFont(p), color:rgb(c.r,c.g,c.b),
           });
         }
       }
 
       const signed = await doc.save();
-      const blob = new Blob([signed], { type: 'application/pdf' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `signed-${filename}`;
-      a.click();
+      const url = URL.createObjectURL(new Blob([signed], { type:'application/pdf' }));
+      const a   = document.createElement('a');
+      a.href = url; a.download = `signed-${filename}`; a.click();
       URL.revokeObjectURL(url);
-      setStatus({ msg: 'Signed PDF downloaded!', type: 'ok' });
+      setStatus({ msg:'Signed PDF downloaded!', type:'ok' });
     } catch (err: any) {
-      setStatus({ msg: `Download failed: ${err.message}`, type: 'err' });
+      setStatus({ msg:`Download failed: ${err.message}`, type:'err' });
     } finally {
       setDownloading(false);
     }
   }
 
-  // ---- Close overlay -------------------------------------------------------
-
   function close() {
-    // Notify the parent content script to remove this iframe
-    window.parent.postMessage({ type: 'AFFIXAI_CLOSE_SIGNING' }, '*');
+    window.parent.postMessage({ type:'AFFIXAI_CLOSE_SIGNING' }, '*');
     window.close();
   }
 
-  // ---- Render --------------------------------------------------------------
+  // ── render ────────────────────────────────────────────────────────────────
 
-  const noSig = !sigDataUrl;
-  const readyToPlace =
-    (activeTool === 'signature' && !!sigDataUrl) ||
-    (activeTool === 'initials' && !!initDataUrl) ||
-    activeTool === 'date' ||
-    (activeTool === 'text' && !!customText);
+  const selectedPlacement = selectedIdx !== null ? placements[selectedIdx] : null;
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: '#0f1219', color: '#e2e8f0', fontFamily: 'system-ui,-apple-system,sans-serif' }}>
-      {/* ── Header ── */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 18px', background: '#161b27', borderBottom: '1px solid #2d3448' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <div style={{ width: 28, height: 28, borderRadius: 8, background: 'linear-gradient(135deg,#a855f7,#ec4899)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 14, color: '#fff' }}>✦</div>
-          <div>
-            <div style={{ fontWeight: 700, fontSize: 14, lineHeight: 1 }}>AffixAI — Sign Document</div>
-            <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>{filename}</div>
-          </div>
-        </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button onClick={downloadSigned} disabled={stamps.length === 0 || downloading}
-            style={{ padding: '7px 16px', borderRadius: 8, border: 'none', cursor: stamps.length === 0 ? 'default' : 'pointer', fontWeight: 700, fontSize: 12, background: stamps.length === 0 ? '#374151' : 'linear-gradient(135deg,#a855f7,#ec4899)', color: '#fff', opacity: downloading ? 0.6 : 1 }}>
-            {downloading ? 'Saving…' : `⬇ Download Signed PDF${stamps.length > 0 ? ` (${stamps.length})` : ''}`}
-          </button>
-          <button onClick={close}
-            style={{ padding: '7px 14px', borderRadius: 8, border: '1px solid #374151', background: 'transparent', color: '#94a3b8', cursor: 'pointer', fontSize: 13 }}>
-            ✕ Close
-          </button>
-        </div>
-      </div>
+    <div style={{ display:'flex', flexDirection:'column', height:'100vh', background:C.bgInset,
+      color:C.fg, fontFamily:'system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', fontSize:14 }}>
 
-      {/* ── Status bar ── */}
-      {status && (
-        <div style={{ padding: '6px 18px', fontSize: 12, background: status.type === 'ok' ? '#14532d' : '#7f1d1d', color: status.type === 'ok' ? '#86efac' : '#fca5a5' }}>
-          {status.msg}
-          <button onClick={() => setStatus(null)} style={{ marginLeft: 10, background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', fontSize: 12 }}>✕</button>
+      {/* Drawing modal */}
+      {drawingOpen && (
+        <div style={{ position:'fixed', inset:0, zIndex:200, background:'rgba(0,0,0,0.55)',
+          backdropFilter:'blur(4px)', display:'flex', alignItems:'center', justifyContent:'center' }}
+          onClick={() => setDrawingOpen(false)}>
+          <div style={{ background:C.bgElevated, borderRadius:16, padding:24, width:380,
+            maxWidth:'90vw', border:`1px solid ${C.border}`, boxShadow:'0 24px 64px rgba(0,0,0,0.3)' }}
+            onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ fontSize:16, fontWeight:700, color:C.fg, marginBottom:4, margin:0 }}>Draw your signature</h3>
+            <p style={{ fontSize:12, color:C.fgMuted, marginTop:4, marginBottom:14 }}>
+              Sign in the box below using your mouse or touch.
+            </p>
+            <div style={{ borderRadius:10, overflow:'hidden', border:`1px solid ${C.borderStrong}`, background:'#fff' }}>
+              <canvas ref={drawPadRef} width={332} height={120}
+                style={{ display:'block', touchAction:'none', cursor:'crosshair', width:'100%' }}
+                onMouseDown={padStart} onMouseMove={padMove}
+                onMouseUp={padEnd} onMouseLeave={padEnd}
+                onTouchStart={(e) => { e.preventDefault(); padStart(e); }}
+                onTouchMove={(e)  => { e.preventDefault(); padMove(e); }}
+                onTouchEnd={padEnd}
+              />
+            </div>
+            <div style={{ display:'flex', gap:8, marginTop:12 }}>
+              {[['Clear', clearPad], ['Cancel', () => setDrawingOpen(false)]].map(([label, fn]: any) => (
+                <button key={label} onClick={fn} style={{ flex:1, height:38, borderRadius:9,
+                  border:`1px solid ${C.border}`, background:'transparent', color:C.fgMuted, fontSize:13, cursor:'pointer' }}>
+                  {label}
+                </button>
+              ))}
+              <button onClick={saveDrawing} style={{ flex:1, height:38, borderRadius:9, border:'none',
+                background:C.brandGrad, color:'#fff', fontSize:13, fontWeight:600, cursor:'pointer' }}>
+                Use this
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
-      {/* ── Main area ── */}
-      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+      {/* Header */}
+      <header style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+        padding:'10px 18px', background:C.bgElevated, borderBottom:`1px solid ${C.border}`,
+        boxShadow:'0 1px 3px rgba(0,0,0,0.06)', flexShrink:0 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+          <div style={{ width:32, height:32, borderRadius:9, background:C.brandGrad,
+            display:'flex', alignItems:'center', justifyContent:'center', fontWeight:700, fontSize:14, color:'#fff' }}>✦</div>
+          <div>
+            <div style={{ fontWeight:700, fontSize:14, lineHeight:1, color:C.fg }}>Sign Document</div>
+            <div style={{ fontSize:11, color:C.fgMuted, marginTop:2 }}>{filename}</div>
+          </div>
+        </div>
+        <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+          <button onClick={downloadSigned} disabled={placements.length===0||downloading}
+            style={{ display:'flex', alignItems:'center', gap:6, padding:'8px 16px', borderRadius:10,
+              border:'none', cursor:placements.length===0?'not-allowed':'pointer', fontWeight:600, fontSize:13,
+              background:placements.length===0?C.bgInset:C.brandGrad,
+              color:placements.length===0?C.fgSubtle:'#fff', opacity:downloading?0.6:1, transition:'opacity 0.15s' }}>
+            {downloading ? '⏳ Saving…' : `↓ Save & download${placements.length>0?` (${placements.length})`:''}`}
+          </button>
+          <button onClick={close} style={{ padding:'8px 14px', borderRadius:10,
+            border:`1px solid ${C.border}`, background:'transparent', color:C.fgMuted, cursor:'pointer', fontSize:13 }}>
+            ✕ Close
+          </button>
+        </div>
+      </header>
 
-        {/* ── PDF Viewer (left) ── */}
-        <div ref={pdfAreaRef} style={{ flex: 1, overflowY: 'auto', padding: '20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 20, background: '#1a2035' }}>
-          {pageCanvases.length === 0 && (
-            <div style={{ color: '#64748b', marginTop: 80, textAlign: 'center' }}>
-              {pdfBytes ? (
-                <>
-                  <div style={{ fontSize: 32, marginBottom: 12 }}>⏳</div>
-                  <div>Rendering PDF…</div>
-                </>
-              ) : (
-                <>
-                  <div style={{ fontSize: 32, marginBottom: 12 }}>📄</div>
-                  <div>Loading PDF…</div>
-                </>
-              )}
+      {/* Status bar */}
+      {status && (
+        <div style={{ padding:'7px 18px', fontSize:12, display:'flex', alignItems:'center', justifyContent:'space-between',
+          background:status.type==='ok'?'#f0fdf4':'#fef2f2',
+          color:status.type==='ok'?C.success:C.danger,
+          borderBottom:`1px solid ${status.type==='ok'?'#bbf7d0':'#fecaca'}` }}>
+          <span>{status.msg}</span>
+          <button onClick={() => setStatus(null)}
+            style={{ background:'none', border:'none', color:'inherit', cursor:'pointer', fontSize:14, padding:'0 4px' }}>✕</button>
+        </div>
+      )}
+
+      {/* Body */}
+      <div style={{ display:'flex', flex:1, overflow:'hidden' }}>
+
+        {/* PDF viewer */}
+        <div style={{ flex:1, overflowY:'auto', padding:'28px 0',
+          display:'flex', flexDirection:'column', alignItems:'center', gap:28, background:C.bgInset }}>
+
+          {pageInfos.length===0 && (
+            <div style={{ color:C.fgSubtle, marginTop:80, textAlign:'center' }}>
+              {pdfBytes ? <div><div style={{ fontSize:28 }}>⏳</div><div style={{ marginTop:8 }}>Rendering PDF…</div></div>
+                        : <div><div style={{ fontSize:28 }}>📄</div><div style={{ marginTop:8 }}>Loading PDF…</div></div>}
             </div>
           )}
 
-          {pageCanvases.map((canvas, i) => {
+          {pageInfos.map((info, i) => {
             const pageNum = i + 1;
-            const pageStamps = stamps.filter(s => s.page === pageNum);
+            const ratio   = info.renderedWidth / info.pdfWidth;
+            const pagePlacements = placements
+              .map((p, idx) => ({ p, idx }))
+              .filter(({ p }) => p.page === pageNum);
+
             return (
-              <div key={i} style={{ position: 'relative', boxShadow: '0 4px 32px rgba(0,0,0,0.5)' }}>
-                {/* Page label */}
-                <div style={{ position: 'absolute', top: -22, left: 0, fontSize: 11, color: '#64748b' }}>
+              <div key={i} style={{ position:'relative' }}>
+                <div style={{ position:'absolute', top:-20, left:0, fontSize:11, color:C.fgSubtle }}>
                   Page {pageNum} / {numPages}
                 </div>
+                <div onClick={(e) => handlePageClick(e, i)}
+                  style={{ position:'relative', cursor:armedItem?'crosshair':'default',
+                    userSelect:'none', boxShadow:'0 4px 24px rgba(0,0,0,0.12)', background:'#fff' }}>
 
-                {/* Clickable overlay */}
-                <div
-                  onClick={(e) => handlePageClick(e, i)}
-                  style={{ position: 'relative', cursor: placingMode ? 'crosshair' : 'default', userSelect: 'none' }}
-                >
-                  {/* PDF page canvas */}
-                  <img
-                    src={canvas.toDataURL()}
-                    alt={`Page ${pageNum}`}
-                    style={{ display: 'block', maxWidth: '100%' }}
-                    width={canvas.width}
-                    height={canvas.height}
-                  />
+                  <img src={info.canvas.toDataURL()} alt={`Page ${pageNum}`}
+                    style={{ display:'block' }} width={info.renderedWidth} height={info.renderedHeight} draggable={false} />
 
-                  {/* Placed stamps overlay */}
-                  {pageStamps.map(stamp => (
-                    <div
-                      key={stamp.id}
-                      onMouseDown={(e) => startDrag(e, stamp.id, stamp.x, stamp.y)}
-                      style={{
-                        position: 'absolute',
-                        left: stamp.x, top: stamp.y,
-                        width: stamp.width, height: stamp.height,
-                        cursor: 'grab',
-                        border: '2px dashed #a855f7',
-                        borderRadius: 4,
-                        background: 'rgba(168,85,247,0.06)',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        userSelect: 'none',
-                      }}
-                    >
-                      {stamp.dataUrl ? (
-                        <img src={stamp.dataUrl} alt="sig"
-                          style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', pointerEvents: 'none' }} />
-                      ) : (
-                        <span style={{ fontSize: 13, color: '#1a1a2e', fontWeight: 600, pointerEvents: 'none' }}>
-                          {stamp.text}
-                        </span>
-                      )}
-                      {/* Remove button */}
-                      <button
-                        onClick={(e) => { e.stopPropagation(); removeStamp(stamp.id); }}
-                        onMouseDown={(e) => e.stopPropagation()}
+                  {pagePlacements.map(({ p, idx: globalIdx }) => {
+                    const isSelected  = selectedIdx === globalIdx;
+                    const isImgKind   = p.kind === 'signature';
+                    const left  = p.x * ratio;
+                    const top   = p.y * ratio;
+                    const w     = p.width  * ratio;
+                    const h     = p.height * ratio;
+                    const fontCss = FONT_FAMILIES.find(f => f.value === p.font_family)?.cssFamily || 'inherit';
+
+                    return (
+                      <div key={p.id}
+                        onMouseDown={(e) => startDrag(e, p.id)}
+                        onClick={(e) => { e.stopPropagation(); setSelectedIdx(globalIdx); setArmedItem(null); }}
                         style={{
-                          position: 'absolute', top: -10, right: -10,
-                          width: 20, height: 20, borderRadius: '50%',
-                          background: '#ef4444', border: 'none', color: '#fff',
-                          fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                          fontWeight: 700,
-                        }}
-                      >✕</button>
-                    </div>
-                  ))}
+                          position:'absolute', left, top,
+                          width: isImgKind ? w : undefined,
+                          height: isImgKind ? h : undefined,
+                          zIndex: isSelected ? 11 : 10,
+                          cursor:'move',
+                          border: isSelected ? `1px solid ${C.brand500}` : '1px solid transparent',
+                          borderRadius:2,
+                          background: isSelected ? C.brandSoft : 'transparent',
+                          display:'flex', alignItems:'center',
+                        }}>
+                        <div style={{
+                          flex:1, minWidth:0, padding:'0 2px', lineHeight:1.2,
+                          whiteSpace:'nowrap', overflow:'hidden',
+                          ...(isImgKind ? {} : {
+                            fontFamily: fontCss,
+                            fontSize:`${Math.max(p.fontsize,6)}px`,
+                            fontWeight: p.bold ? 700 : 400,
+                            fontStyle:  p.italic ? 'italic' : 'normal',
+                            color: p.color,
+                          }),
+                        }}>
+                          {p.kind==='signature' && (
+                            sigUrl
+                              ? <img src={sigUrl} alt="sig" draggable={false}
+                                  style={{ maxWidth:'100%', maxHeight:'100%', objectFit:'contain', pointerEvents:'none', display:'block' }} />
+                              : <span style={{ color:C.danger, fontStyle:'italic', fontSize:12 }}>No signature saved</span>
+                          )}
+                          {p.kind!=='signature' && (
+                            <input
+                              type={p.kind==='number'?'number':p.kind==='date'?'date':p.kind==='time'?'time':'text'}
+                              value={p.value}
+                              onChange={(e) => updPlacement(p.id, { value:e.target.value })}
+                              onClick={(ev) => ev.stopPropagation()}
+                              onMouseDown={(ev) => ev.stopPropagation()}
+                              placeholder={p.kind}
+                              draggable={false}
+                              style={{ background:'transparent', outline:'none', border:'none',
+                                fontFamily:'inherit', fontSize:'inherit', fontWeight:'inherit',
+                                fontStyle:'inherit', color:'inherit', minWidth:30, cursor:'text' }}
+                            />
+                          )}
+                        </div>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); delPlacement(p.id); }}
+                          onMouseDown={(e) => e.stopPropagation()}
+                          draggable={false}
+                          style={{ position:'absolute', top:-8, right:-8, width:16, height:16,
+                            borderRadius:'50%', background:C.danger, border:'none', color:'#fff',
+                            fontSize:10, cursor:'pointer', display:'flex', alignItems:'center',
+                            justifyContent:'center', fontWeight:700 }}>✕</button>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             );
           })}
         </div>
 
-        {/* ── Tools Sidebar (right) ── */}
-        <div style={{ width: 240, background: '#161b27', borderLeft: '1px solid #2d3448', display: 'flex', flexDirection: 'column', padding: 14, gap: 14, overflowY: 'auto' }}>
-
-          {/* Tool selector */}
-          <div>
-            <div style={{ fontSize: 10, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>Tool</div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
-              {(['signature', 'initials', 'date', 'text'] as ToolType[]).map(t => (
-                <button key={t} onClick={() => { setActiveTool(t); setPlacingMode(false); }}
-                  style={{
-                    padding: '6px 4px', borderRadius: 7, border: activeTool === t ? '2px solid #a855f7' : '1px solid #2d3448',
-                    background: activeTool === t ? 'rgba(168,85,247,0.15)' : 'transparent',
-                    color: activeTool === t ? '#c084fc' : '#94a3b8',
-                    fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
-                  }}>
-                  {t === 'signature' ? '✍️ Signature' : t === 'initials' ? '🅰️ Initials' : t === 'date' ? '📅 Date' : '📝 Text'}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div style={{ height: 1, background: '#2d3448' }} />
-
-          {/* Tool-specific UI */}
-          {(activeTool === 'signature' || activeTool === 'initials') && (() => {
-            const isInit = activeTool === 'initials';
-            const padRef = isInit ? initPadRef : sigPadRef;
-            const dataUrl = isInit ? initDataUrl : sigDataUrl;
-            const setter  = isInit ? setInitDataUrl : setSigDataUrl;
-            return (
-              <div>
-                <div style={{ fontSize: 10, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>
-                  Draw your {isInit ? 'initials' : 'signature'}
-                </div>
-                <div style={{ borderRadius: 8, overflow: 'hidden', border: '1px solid #374151', background: '#fff' }}>
-                  <canvas
-                    ref={padRef}
-                    width={210} height={isInit ? 70 : 100}
-                    style={{ display: 'block', touchAction: 'none', cursor: 'crosshair' }}
-                    onMouseDown={(e) => padStart(e, padRef)}
-                    onMouseMove={(e) => padMove(e, padRef)}
-                    onMouseUp={() => padEnd(padRef, setter)}
-                    onMouseLeave={() => { if (isDrawing.current) padEnd(padRef, setter); }}
-                    onTouchStart={(e) => { e.preventDefault(); padStart(e, padRef); }}
-                    onTouchMove={(e) => { e.preventDefault(); padMove(e, padRef); }}
-                    onTouchEnd={() => padEnd(padRef, setter)}
-                  />
-                </div>
-                <button onClick={() => clearPad(padRef, setter)}
-                  style={{ marginTop: 6, width: '100%', padding: '5px 0', borderRadius: 6, border: '1px solid #374151', background: 'transparent', color: '#94a3b8', fontSize: 11, cursor: 'pointer', fontFamily: 'inherit' }}>
-                  Clear
-                </button>
-                {dataUrl && (
-                  <div style={{ marginTop: 6, fontSize: 11, color: '#86efac' }}>✓ {isInit ? 'Initials' : 'Signature'} captured</div>
-                )}
-              </div>
-            );
-          })()}
-
-          {activeTool === 'text' && (
-            <div>
-              <div style={{ fontSize: 10, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Text to stamp</div>
-              <input
-                value={customText}
-                onChange={(e) => setCustomText(e.target.value)}
-                placeholder="Type text…"
-                style={{ width: '100%', padding: '7px 10px', borderRadius: 7, border: '1px solid #374151', background: '#0f1219', color: '#e2e8f0', fontSize: 12, fontFamily: 'inherit', outline: 'none' }}
+        {/* Right panel */}
+        <div style={{ width:320, background:C.bgElevated, borderLeft:`1px solid ${C.border}`,
+          display:'flex', flexDirection:'column', overflowY:'auto', flexShrink:0 }}>
+          <div style={{ padding:16 }}>
+            {selectedPlacement ? (
+              <FontControls
+                placement={selectedPlacement}
+                onChange={(ch) => updPlacement(selectedPlacement.id, ch)}
+                onDeselect={() => setSelectedIdx(null)}
               />
-            </div>
-          )}
-
-          {activeTool === 'date' && (
-            <div style={{ fontSize: 12, color: '#94a3b8', padding: '6px 10px', borderRadius: 7, border: '1px solid #374151', background: '#0f1219' }}>
-              Stamps today: <strong style={{ color: '#e2e8f0' }}>{new Date().toLocaleDateString()}</strong>
-            </div>
-          )}
-
-          {/* Place button */}
-          {pageCanvases.length > 0 && (
-            <button
-              onClick={() => {
-                if (!readyToPlace) {
-                  setStatus({ msg: activeTool === 'signature' ? 'Draw your signature above first.' : activeTool === 'initials' ? 'Draw your initials above first.' : 'Enter text above first.', type: 'err' });
-                  return;
-                }
-                setPlacingMode(true);
-                setStatus({ msg: 'Click anywhere on the PDF to place it.', type: 'ok' });
-              }}
-              style={{
-                width: '100%', padding: '10px 0', borderRadius: 8, border: 'none',
-                background: placingMode ? 'rgba(168,85,247,0.3)' : 'linear-gradient(135deg,#a855f7,#ec4899)',
-                color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit',
-                boxShadow: placingMode ? 'none' : '0 2px 12px rgba(168,85,247,0.4)',
-              }}>
-              {placingMode ? '🎯 Click on the PDF…' : '＋ Place on PDF'}
-            </button>
-          )}
-
-          {placingMode && (
-            <button onClick={() => setPlacingMode(false)}
-              style={{ width: '100%', padding: '6px 0', borderRadius: 7, border: '1px solid #374151', background: 'transparent', color: '#94a3b8', fontSize: 11, cursor: 'pointer', fontFamily: 'inherit' }}>
-              Cancel
-            </button>
-          )}
-
-          <div style={{ height: 1, background: '#2d3448' }} />
-
-          {/* Stamp summary */}
-          {stamps.length > 0 && (
-            <div>
-              <div style={{ fontSize: 10, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>
-                Placed ({stamps.length})
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                {stamps.map(s => (
-                  <div key={s.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '4px 8px', borderRadius: 6, background: '#0f1219', fontSize: 11 }}>
-                    <span style={{ color: '#94a3b8' }}>
-                      {s.type === 'signature' ? '✍️' : s.type === 'initials' ? '🅰️' : s.type === 'date' ? '📅' : '📝'}
-                      {' '}p.{s.page}
-                    </span>
-                    <button onClick={() => removeStamp(s.id)}
-                      style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 12, padding: '0 2px' }}>✕</button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Download in sidebar too */}
-          <div style={{ marginTop: 'auto' }}>
-            <button onClick={downloadSigned} disabled={stamps.length === 0 || downloading}
-              style={{ width: '100%', padding: '10px 0', borderRadius: 8, border: 'none', cursor: stamps.length === 0 ? 'default' : 'pointer', fontWeight: 700, fontSize: 12, fontFamily: 'inherit', background: stamps.length === 0 ? '#1e293b' : 'linear-gradient(135deg,#a855f7,#ec4899)', color: stamps.length === 0 ? '#475569' : '#fff', opacity: downloading ? 0.6 : 1 }}>
-              {downloading ? 'Saving…' : '⬇ Download Signed PDF'}
-            </button>
+            ) : (
+              <PalettePanel
+                placements={placements}
+                armedItem={armedItem}
+                defaults={defaults}
+                defaultsOpen={defaultsOpen}
+                sigUrl={sigUrl}
+                onDefaultsToggle={() => setDefaultsOpen(v => !v)}
+                onDefaultsChange={updateDefaults}
+                onArm={armItem}
+                onDisarm={() => setArmedItem(null)}
+                onRedrawSig={() => setDrawingOpen(true)}
+              />
+            )}
           </div>
-
         </div>
       </div>
     </div>
   );
 }
 
-// ---- Util -------------------------------------------------------------------
+// ─── PalettePanel ────────────────────────────────────────────────────────────
 
-function relPos(e: React.MouseEvent | React.TouchEvent, el: HTMLElement) {
-  const rect = el.getBoundingClientRect();
-  if ('touches' in e) {
-    return { x: e.touches[0].clientX - rect.left, y: e.touches[0].clientY - rect.top };
-  }
-  return { x: (e as React.MouseEvent).clientX - rect.left, y: (e as React.MouseEvent).clientY - rect.top };
+function PalettePanel({ placements, armedItem, defaults, defaultsOpen, sigUrl,
+  onDefaultsToggle, onDefaultsChange, onArm, onDisarm, onRedrawSig }: {
+  placements:       Placement[];
+  armedItem:        PaletteItem|null;
+  defaults:         FontDefaults;
+  defaultsOpen:     boolean;
+  sigUrl:           string|null;
+  onDefaultsToggle: () => void;
+  onDefaultsChange: (v:FontDefaults) => void;
+  onArm:            (item:PaletteItem) => void;
+  onDisarm:         () => void;
+  onRedrawSig:      () => void;
+}) {
+  return (
+    <>
+      <h2 style={{ fontSize:16, fontWeight:700, color:C.fg, margin:'0 0 2px' }}>Add fields to document</h2>
+      <p style={{ fontSize:12, color:C.fgMuted, margin:'0 0 12px' }}>
+        {placements.length} placement{placements.length===1?'':'s'}
+      </p>
+
+      {armedItem && (
+        <div style={{ marginBottom:12, padding:'8px 10px', borderRadius:10,
+          border:`1px solid ${C.brand500}40`, background:C.brandSoft,
+          display:'flex', alignItems:'center', gap:8 }}>
+          <div style={{ width:28, height:28, borderRadius:7, background:C.bgElevated,
+            border:`1px solid ${C.border}`, display:'grid', placeItems:'center',
+            flexShrink:0, fontSize:13, color:C.fgMuted }}>
+            {ICONS[armedItem.kind]}
+          </div>
+          <div style={{ flex:1, minWidth:0 }}>
+            <div style={{ fontSize:13, fontWeight:600, color:C.fg, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+              {armedItem.label}
+            </div>
+            <div style={{ fontSize:11, color:C.fgMuted }}>Click on the document to drop. Esc cancels.</div>
+          </div>
+          <button onClick={onDisarm}
+            style={{ fontSize:11, color:C.fgMuted, padding:'4px 8px', borderRadius:6,
+              border:`1px solid ${C.border}`, background:'transparent', cursor:'pointer', flexShrink:0 }}>
+            Done
+          </button>
+        </div>
+      )}
+
+      <DefaultsBlock value={defaults} open={defaultsOpen} onToggle={onDefaultsToggle} onChange={onDefaultsChange} />
+
+      <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+        {PALETTE.map((item) => {
+          const isArmed = armedItem?.id === item.id;
+          const isSig   = item.kind === 'signature';
+          return (
+            <div key={item.id} onClick={() => onArm(item)}
+              style={{ padding:'8px 10px', borderRadius:10, cursor:'pointer',
+                border:`1px solid ${isArmed ? `${C.brand500}60` : C.border}`,
+                background: isArmed ? C.brandSoft : C.bgInset,
+                boxShadow: isArmed ? `0 0 0 2px ${C.brand500}25` : undefined,
+                display:'flex', alignItems:'center', gap:8, transition:'all 0.12s' }}>
+              <div style={{ width:28, height:28, borderRadius:7, background:C.bgElevated,
+                border:`1px solid ${C.border}`, display:'grid', placeItems:'center',
+                flexShrink:0, fontSize:13, color:C.fgMuted }}>
+                {ICONS[item.kind]}
+              </div>
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ fontSize:13, fontWeight:500, color:C.fg }}>{item.label}</div>
+                {isSig && !sigUrl && (
+                  <div style={{ fontSize:11, color:C.fgSubtle }}>Click to draw signature</div>
+                )}
+                {isSig && sigUrl && (
+                  <div style={{ fontSize:11, color:C.success }}>✓ Ready</div>
+                )}
+              </div>
+              {isArmed && (
+                <span style={{ fontSize:10, textTransform:'uppercase', letterSpacing:'0.08em',
+                  color:C.brand400, fontWeight:700, flexShrink:0 }}>armed</span>
+              )}
+              {isSig && sigUrl && !isArmed && (
+                <button onClick={(e) => { e.stopPropagation(); onRedrawSig(); }}
+                  style={{ fontSize:10, color:C.fgMuted, padding:'2px 6px', borderRadius:4,
+                    border:`1px solid ${C.border}`, background:C.bgElevated, cursor:'pointer', flexShrink:0 }}>
+                  Redraw
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
 }
+
+// ─── DefaultsBlock ────────────────────────────────────────────────────────────
+
+function DefaultsBlock({ value, open, onToggle, onChange }: {
+  value:    FontDefaults;
+  open:     boolean;
+  onToggle: () => void;
+  onChange: (v:FontDefaults) => void;
+}) {
+  const label  = FONT_FAMILIES.find(f => f.value===value.font_family)?.label ?? value.font_family;
+  const css    = FONT_FAMILIES.find(f => f.value===value.font_family)?.cssFamily || 'inherit';
+  return (
+    <div style={{ marginBottom:12, borderRadius:10, border:`1px solid ${C.border}`, background:C.bgInset, overflow:'hidden' }}>
+      <button onClick={onToggle}
+        style={{ width:'100%', display:'flex', alignItems:'center', justifyContent:'space-between',
+          padding:'8px 10px', background:'transparent', border:'none', cursor:'pointer' }}>
+        <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+          <span style={{ fontSize:10, textTransform:'uppercase', letterSpacing:'0.08em', color:C.fgSubtle }}>Default font</span>
+          <span style={{ fontSize:12, fontFamily:css, fontWeight:value.bold?700:400,
+            fontStyle:value.italic?'italic':'normal', color:value.color }}>
+            {label.split(' ')[0]} · {value.fontsize}pt{value.bold?' · B':''}{value.italic?' · I':''}
+          </span>
+        </div>
+        <span style={{ fontSize:13, color:C.fgMuted }}>{open?'−':'+'}</span>
+      </button>
+
+      {open && (
+        <div style={{ padding:'10px 10px 12px', borderTop:`1px solid ${C.border}` }}>
+          <label style={LABEL_STYLE}>Family</label>
+          <FontFamilySelect value={value.font_family} onChange={(v) => onChange({ ...value, font_family:v })} />
+
+          <label style={{ ...LABEL_STYLE, marginTop:10 }}>
+            Size <span style={{ textTransform:'none', color:C.fgMuted }}>({value.fontsize}pt)</span>
+          </label>
+          <input type="range" min={6} max={36} step={1} value={value.fontsize}
+            onChange={(e) => onChange({ ...value, fontsize:Number(e.target.value) })}
+            style={{ width:'100%', marginBottom:10, accentColor:C.brand500 }} />
+
+          <div style={{ display:'flex', gap:8, marginBottom:10 }}>
+            <BIButton label="B" active={value.bold} style={{ fontWeight:700 }} onClick={() => onChange({ ...value, bold:!value.bold })} />
+            <BIButton label="I" active={value.italic} style={{ fontStyle:'italic' }} onClick={() => onChange({ ...value, italic:!value.italic })} />
+          </div>
+
+          <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+            <input type="color" value={value.color}
+              onChange={(e) => onChange({ ...value, color:e.target.value })}
+              style={{ height:32, width:32, borderRadius:8, border:`1px solid ${C.border}`, cursor:'pointer', padding:2 }} />
+            <input type="text" value={value.color}
+              onChange={(e) => onChange({ ...value, color:e.target.value })}
+              style={{ flex:1, height:32, padding:'0 8px', borderRadius:8, border:`1px solid ${C.border}`,
+                background:C.bgElevated, fontSize:12, fontFamily:'monospace', color:C.fg }} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── FontControls ─────────────────────────────────────────────────────────────
+
+function FontControls({ placement:p, onChange, onDeselect }: {
+  placement: Placement;
+  onChange:  (ch:Partial<Placement>) => void;
+  onDeselect:() => void;
+}) {
+  const isText = !['signature'].includes(p.kind);
+  return (
+    <div>
+      <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', marginBottom:12 }}>
+        <div>
+          <h2 style={{ fontSize:16, fontWeight:700, color:C.fg, textTransform:'capitalize', margin:0 }}>
+            {p.kind} placement
+          </h2>
+          <p style={{ fontSize:11, color:C.fgMuted, margin:'2px 0 0' }}>Page {p.page}</p>
+        </div>
+        <button onClick={onDeselect}
+          style={{ width:28, height:28, borderRadius:8, border:`1px solid ${C.border}`,
+            background:'transparent', color:C.fgMuted, cursor:'pointer', display:'grid', placeItems:'center', fontSize:14 }}>
+          ×
+        </button>
+      </div>
+
+      {!isText ? (
+        <p style={{ fontSize:12, color:C.fgMuted, padding:'10px 12px', borderRadius:10,
+          background:C.bgInset, border:`1px solid ${C.border}`, margin:0 }}>
+          Signature placement. Drag to reposition on the PDF.
+        </p>
+      ) : (
+        <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
+          <div>
+            <label style={LABEL_STYLE}>Font family</label>
+            <FontFamilySelect value={p.font_family??'helv'} onChange={(v) => onChange({ font_family:v })} />
+            {p.value && (
+              <div style={{ marginTop:6, padding:'7px 10px', borderRadius:8, border:`1px solid ${C.border}`,
+                background:C.bgBase, fontSize:13, color:C.fg, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap',
+                fontFamily:FONT_FAMILIES.find(f=>f.value===p.font_family)?.cssFamily||'inherit' }}>
+                {p.value}
+              </div>
+            )}
+          </div>
+
+          <div>
+            <label style={LABEL_STYLE}>
+              Size <span style={{ fontWeight:400, color:C.fgSubtle }}>({p.fontsize??10}pt)</span>
+            </label>
+            <input type="range" min={6} max={36} step={1} value={p.fontsize??10}
+              onChange={(e) => onChange({ fontsize:Number(e.target.value) })}
+              style={{ width:'100%', accentColor:C.brand500 }} />
+            <div style={{ display:'flex', gap:4, marginTop:6 }}>
+              {[8,10,12,14,18,24].map(s => (
+                <button key={s} onClick={() => onChange({ fontsize:s })}
+                  style={{ flex:1, height:28, fontSize:11, borderRadius:6, cursor:'pointer',
+                    border:`1px solid ${(p.fontsize??10)===s?`${C.brand500}60`:C.border}`,
+                    background:(p.fontsize??10)===s?`${C.brand500}15`:'transparent',
+                    color:(p.fontsize??10)===s?C.fg:C.fgMuted }}>{s}</button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ display:'flex', gap:8 }}>
+            <BIButton label="B" active={!!p.bold} style={{ fontWeight:700, fontSize:15 }} onClick={() => onChange({ bold:!p.bold })} />
+            <BIButton label="I" active={!!p.italic} style={{ fontStyle:'italic', fontSize:15 }} onClick={() => onChange({ italic:!p.italic })} />
+          </div>
+
+          <div>
+            <label style={LABEL_STYLE}>Color</label>
+            <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8 }}>
+              <input type="color" value={p.color??'#000000'}
+                onChange={(e) => onChange({ color:e.target.value })}
+                style={{ height:36, width:36, borderRadius:8, border:`1px solid ${C.border}`, cursor:'pointer', padding:2 }} />
+              <input type="text" value={p.color??'#000000'}
+                onChange={(e) => onChange({ color:e.target.value })}
+                style={{ flex:1, height:36, padding:'0 8px', borderRadius:8, border:`1px solid ${C.border}`,
+                  background:C.bgElevated, fontSize:12, fontFamily:'monospace', color:C.fg }} />
+            </div>
+            <div style={{ display:'grid', gridTemplateColumns:'repeat(6,1fr)', gap:6 }}>
+              {COLOR_PRESETS.map(c => (
+                <button key={c} onClick={() => onChange({ color:c })}
+                  style={{ aspectRatio:'1', borderRadius:6, cursor:'pointer',
+                    border:`2px solid ${p.color===c?C.brand400:'transparent'}`,
+                    background:c, transition:'border-color 0.1s' }}
+                  title={c} />
+              ))}
+            </div>
+          </div>
+
+          <div style={{ paddingTop:8, borderTop:`1px solid ${C.border}` }}>
+            <p style={{ fontSize:11, color:C.fgSubtle, margin:0 }}>
+              Drag the placement box on the PDF to reposition it.
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── shared sub-components ────────────────────────────────────────────────────
+
+function FontFamilySelect({ value, onChange }: { value:string; onChange:(v:string)=>void }) {
+  return (
+    <select value={value} onChange={(e) => onChange(e.target.value)}
+      style={{ width:'100%', height:34, padding:'0 8px', borderRadius:8,
+        border:`1px solid ${C.border}`, background:C.bgElevated, fontSize:13, color:C.fg,
+        display:'block', marginBottom:0 }}>
+      <optgroup label="Standard">
+        {FONT_FAMILIES.filter(f=>['sans','serif','mono'].includes(f.category||'')).map(f=>(
+          <option key={f.value} value={f.value}>{f.label}</option>
+        ))}
+      </optgroup>
+      <optgroup label="Signing">
+        {FONT_FAMILIES.filter(f=>['script','calligraphy','handwriting','signature'].includes(f.category||'')).map(f=>(
+          <option key={f.value} value={f.value}>{f.label}</option>
+        ))}
+      </optgroup>
+    </select>
+  );
+}
+
+function BIButton({ label, active, style, onClick }: {
+  label:string; active:boolean; style?:React.CSSProperties; onClick:()=>void;
+}) {
+  return (
+    <button onClick={onClick}
+      style={{ flex:1, height:36, borderRadius:8, cursor:'pointer',
+        border:`1px solid ${active?`${C.brand500}60`:C.border}`,
+        background:active?`${C.brand500}15`:'transparent',
+        color:active?C.fg:C.fgMuted, fontSize:14, ...style }}>
+      {label}
+    </button>
+  );
+}
+
+const LABEL_STYLE: React.CSSProperties = {
+  display:'block', fontSize:12, fontWeight:500, color:C.fgMuted, marginBottom:4,
+};
