@@ -56,6 +56,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
+
+  // Content scripts cannot access chrome.storage.session directly — route here.
+  if (msg.type === 'STORE_SIGNING_PDF') {
+    chrome.storage.session.set(
+      { affixai_signing_pdf: msg.base64, affixai_signing_name: msg.filename },
+      () => sendResponse({ ok: true })
+    );
+    return true;
+  }
 });
 
 async function getToken(): Promise<string | null> {

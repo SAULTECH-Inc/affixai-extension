@@ -526,10 +526,9 @@ function injectPdfToolbox(): void {
       }
       setStatus('Reading PDF…', 'ld');
       const base64 = localBase64 || await fetchPdfBase64();
-      await chrome.storage.session.set({
-        affixai_signing_pdf: base64,
-        affixai_signing_name: getPdfFilename(),
-      });
+      // Route session storage through background — content scripts cannot
+      // access chrome.storage.session directly in MV3.
+      await send({ type: 'STORE_SIGNING_PDF', base64, filename: getPdfFilename() });
       clearSt();
       busy(false);
       injectSigningIframe();
