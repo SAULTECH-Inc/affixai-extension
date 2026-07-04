@@ -394,7 +394,7 @@ function injectPdfToolbox(): void {
       host.style.top = `${newTop}px`;
     };
 
-    const onUp = (ev: MouseEvent) => {
+    const onUp = (_ev: MouseEvent) => {
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
       if (!didDrag) {
@@ -433,10 +433,49 @@ function injectPdfToolbox(): void {
     });
   }
 
+  // ---- File picker for local PDFs (file:// protocol) ----------------------
+  // fetch() and XHR both fail for file:// URLs in content scripts.
+  // The only reliable approach is a user-triggered <input type="file">.
+  // input.click() must be called synchronously before any await — Chrome's
+  // user-activation window covers synchronous code within the click handler.
+  function pickLocalPdf(): Promise<string> {
+    return new Promise((resolve) => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'application/pdf,.pdf';
+      input.style.cssText = 'position:fixed;top:-999px;left:-999px;opacity:0;pointer-events:none';
+      document.documentElement.appendChild(input);
+      const cleanup = () => { try { document.documentElement.removeChild(input); } catch { /* ignore */ } };
+      input.addEventListener('change', async () => {
+        cleanup();
+        const file = input.files?.[0];
+        if (!file) { resolve(''); return; }
+        const buf = await file.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let bin = '';
+        for (let i = 0; i < bytes.byteLength; i += 8192)
+          bin += String.fromCharCode(...bytes.subarray(i, Math.min(i + 8192, bytes.byteLength)));
+        resolve(btoa(bin));
+      });
+      input.addEventListener('cancel', () => { cleanup(); resolve(''); });
+      input.click(); // synchronous — still within user-gesture context
+    });
+  }
+
   // ---- Button handlers -----------------------------------------------------
   async function run(mode: 'edit' | 'auto') {
     busy(true);
     setStatus('Checking sign-in…', 'ld');
+
+    // For local files, trigger the file picker NOW — synchronously before
+    // any await so we're still inside the user-gesture activation window.
+    let localBase64 = '';
+    if (window.location.href.startsWith('file://')) {
+      setStatus('Select the PDF file…', 'ld');
+      localBase64 = await pickLocalPdf(); // input.click() ran synchronously above
+      if (!localBase64) { busy(false); clearSt(); return; }
+    }
+
     try {
       const auth = await send({ type: 'GET_AUTH_STATE' });
       if (!auth?.authenticated) {
@@ -445,7 +484,7 @@ function injectPdfToolbox(): void {
         return;
       }
       setStatus('Reading PDF…', 'ld');
-      const base64 = await fetchPdfBase64();
+      const base64 = localBase64 || await fetchPdfBase64();
       setStatus('Uploading…', 'ld');
       const res = await send({ type: 'UPLOAD_PDF_BYTES', base64, filename: getPdfFilename() });
       if (res?.error) throw new Error(res.error);
@@ -461,13 +500,7 @@ function injectPdfToolbox(): void {
       busy(false);
       await send({ type: 'OPEN_TAB', url });
     } catch (err: any) {
-      const m = (err.message || '');
-      setStatus(
-        m.includes('Failed to fetch') || m.includes('file')
-          ? 'Cannot read this PDF. For local files enable "Allow access to file URLs" in Chrome → Extensions → AffixAI.'
-          : m || 'Something went wrong.',
-        'er'
-      );
+      setStatus(err.message || 'Something went wrong.', 'er');
       busy(false);
     }
   }
@@ -475,6 +508,15 @@ function injectPdfToolbox(): void {
   async function openSigningOverlay() {
     busy(true);
     setStatus('Checking sign-in…', 'ld');
+
+    // Same as run() — file picker must be triggered before any await.
+    let localBase64 = '';
+    if (window.location.href.startsWith('file://')) {
+      setStatus('Select the PDF file…', 'ld');
+      localBase64 = await pickLocalPdf();
+      if (!localBase64) { busy(false); clearSt(); return; }
+    }
+
     try {
       const auth = await send({ type: 'GET_AUTH_STATE' });
       if (!auth?.authenticated) {
@@ -483,7 +525,7 @@ function injectPdfToolbox(): void {
         return;
       }
       setStatus('Reading PDF…', 'ld');
-      const base64 = await fetchPdfBase64();
+      const base64 = localBase64 || await fetchPdfBase64();
       await chrome.storage.session.set({
         affixai_signing_pdf: base64,
         affixai_signing_name: getPdfFilename(),
@@ -492,13 +534,7 @@ function injectPdfToolbox(): void {
       busy(false);
       injectSigningIframe();
     } catch (err: any) {
-      const m = (err.message || '');
-      setStatus(
-        m.includes('Failed to fetch') || m.includes('file')
-          ? 'Cannot read this PDF. For local files enable "Allow access to file URLs" in Chrome → Extensions → AffixAI.'
-          : m || 'Something went wrong.',
-        'er'
-      );
+      setStatus(err.message || 'Something went wrong.', 'er');
       busy(false);
     }
   }
@@ -538,4 +574,6 @@ function injectSigningIframe(): void {
   });
 }
 
-// Floating toolbox disabled — PDF controls live in the popup instead.
+if (isPdfPage()) {
+  injectPdfToolbox();
+}
