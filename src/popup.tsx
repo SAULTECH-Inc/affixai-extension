@@ -41,6 +41,11 @@ export default function Popup() {
   const [docs, setDocs] = useState<PendingDoc[] | null>(null);
   const [docsLoading, setDocsLoading] = useState(false);
 
+  // PDF toolbox state (popup-level upload button)
+  const [currentTabUrl, setCurrentTabUrl] = useState('');
+  const [pdfUploading, setPdfUploading] = useState(false);
+  const [pdfMsg, setPdfMsg] = useState('');
+
   // Auth form state
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -53,6 +58,9 @@ export default function Popup() {
       if (!res.affixai_terms) setAuth('terms');
       else if (!res.affixai_token) setAuth('login');
       else setAuth('ready');
+    });
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      setCurrentTabUrl(tabs[0]?.url || '');
     });
   }, []);
 
@@ -145,6 +153,44 @@ export default function Popup() {
   async function openSignPage(token: string) {
     await chrome.tabs.create({ url: `${SIGN_BASE}/${token}` });
     window.close();
+  }
+
+  const currentTabIsPdf =
+    /\.pdf(\?|#|$)/i.test(currentTabUrl) ||
+    (currentTabUrl.startsWith('file://') && currentTabUrl.toLowerCase().includes('.pdf'));
+
+  async function handlePdfUpload(mode: 'edit' | 'auto') {
+    setPdfUploading(true);
+    setPdfMsg('');
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id) throw new Error('No active tab');
+
+      // Ask the content script to fetch the PDF bytes
+      let base64: string;
+      try {
+        base64 = await chrome.tabs.sendMessage(tab.id, { type: 'FETCH_PDF_BASE64' });
+      } catch {
+        // Content script not ready — inject it first
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+        base64 = await chrome.tabs.sendMessage(tab.id, { type: 'FETCH_PDF_BASE64' });
+      }
+
+      const filename = (tab.url || 'document.pdf').split('/').pop()?.split('?')[0] || 'document.pdf';
+      const result = await chrome.runtime.sendMessage({ type: 'UPLOAD_PDF_BYTES', base64, filename });
+      if (result?.error) throw new Error(result.error);
+      const id = result?.document_id || result?.id;
+      if (!id) throw new Error('Upload returned no document ID');
+
+      const url = mode === 'auto'
+        ? `https://affix-ai.com/auto-sign?doc=${id}`
+        : `https://affix-ai.com/documents/${id}/edit`;
+      await chrome.tabs.create({ url });
+      window.close();
+    } catch (err: any) {
+      setPdfMsg(err.message || 'Upload failed');
+      setPdfUploading(false);
+    }
   }
 
   async function handleSignOut() {
@@ -264,6 +310,10 @@ export default function Popup() {
             error={error}
             onSign={openSignPage}
             onRefresh={loadPendingDocs}
+            isPdf={currentTabIsPdf}
+            pdfUploading={pdfUploading}
+            pdfMsg={pdfMsg}
+            onPdfUpload={handlePdfUpload}
           />
         )}
       </div>
@@ -334,24 +384,57 @@ function SignTab({
   error,
   onSign,
   onRefresh,
+  isPdf,
+  pdfUploading,
+  pdfMsg,
+  onPdfUpload,
 }: {
   docs: PendingDoc[] | null;
   loading: boolean;
   error: string;
   onSign: (token: string) => void;
   onRefresh: () => void;
+  isPdf: boolean;
+  pdfUploading: boolean;
+  pdfMsg: string;
+  onPdfUpload: (mode: 'edit' | 'auto') => void;
 }) {
+  const pdfSection = isPdf && (
+    <div className="rounded-xl border border-purple-100 bg-purple-50/60 p-3 space-y-2 mb-2">
+      <p className="text-[11px] font-semibold text-purple-700 uppercase tracking-wider">PDF detected on this tab</p>
+      <div className="flex gap-2">
+        <button
+          onClick={() => onPdfUpload('edit')}
+          disabled={pdfUploading}
+          className="flex-1 py-2 rounded-lg bg-gradient-to-r from-purple-500 to-pink-500 text-white text-[11px] font-semibold hover:opacity-90 transition disabled:opacity-50">
+          {pdfUploading ? 'Uploading…' : '✍️ Open in Affix AI'}
+        </button>
+        <button
+          onClick={() => onPdfUpload('auto')}
+          disabled={pdfUploading}
+          className="flex-1 py-2 rounded-lg border border-purple-200 text-purple-700 text-[11px] font-semibold hover:bg-purple-100 transition disabled:opacity-50">
+          ⚡ Auto-sign
+        </button>
+      </div>
+      {pdfMsg && <p className="text-[10px] text-red-600">{pdfMsg}</p>}
+    </div>
+  );
+
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-8">
-        <div className="h-5 w-5 rounded-full border-2 border-purple-300 border-t-purple-500 animate-spin" />
-      </div>
+      <>
+        {pdfSection}
+        <div className="flex items-center justify-center py-8">
+          <div className="h-5 w-5 rounded-full border-2 border-purple-300 border-t-purple-500 animate-spin" />
+        </div>
+      </>
     );
   }
 
   if (error) {
     return (
       <div className="space-y-3">
+        {pdfSection}
         <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-700">
           {error}
         </div>
@@ -365,20 +448,24 @@ function SignTab({
 
   if (!docs || docs.length === 0) {
     return (
-      <div className="text-center py-8 space-y-2">
-        <div className="text-3xl">🎉</div>
-        <p className="text-sm font-medium text-gray-700">All caught up!</p>
-        <p className="text-[12px] text-gray-500">No documents are waiting for your signature.</p>
-        <button onClick={onRefresh}
-          className="mt-2 text-[11px] text-purple-600 hover:underline">
-          Refresh
-        </button>
+      <div className="space-y-3">
+        {pdfSection}
+        <div className="text-center py-6 space-y-2">
+          <div className="text-3xl">🎉</div>
+          <p className="text-sm font-medium text-gray-700">All caught up!</p>
+          <p className="text-[12px] text-gray-500">No documents are waiting for your signature.</p>
+          <button onClick={onRefresh}
+            className="mt-1 text-[11px] text-purple-600 hover:underline">
+            Refresh
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="space-y-2">
+      {pdfSection}
       <div className="flex items-center justify-between mb-1">
         <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-400">
           {docs.length} pending
