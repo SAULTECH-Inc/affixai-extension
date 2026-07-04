@@ -45,6 +45,7 @@ export default function Popup() {
   const [currentTabUrl, setCurrentTabUrl] = useState('');
   const [pdfUploading, setPdfUploading] = useState(false);
   const [pdfMsg, setPdfMsg] = useState('');
+  const [pdfSigningLoading, setPdfSigningLoading] = useState(false);
 
   // Auth form state
   const [email, setEmail] = useState('');
@@ -193,6 +194,35 @@ export default function Popup() {
     }
   }
 
+  async function handleSignHere() {
+    setPdfSigningLoading(true);
+    setPdfMsg('');
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id) throw new Error('No active tab');
+
+      // Fetch PDF bytes via content script
+      let base64: string;
+      try {
+        base64 = await chrome.tabs.sendMessage(tab.id, { type: 'FETCH_PDF_BASE64' });
+      } catch {
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+        base64 = await chrome.tabs.sendMessage(tab.id, { type: 'FETCH_PDF_BASE64' });
+      }
+      if ((base64 as any)?.error) throw new Error((base64 as any).error);
+
+      const filename = (tab.url || 'document.pdf').split('/').pop()?.split('?')[0] || 'document.pdf';
+      // Store in session storage for the signing iframe to read
+      await chrome.storage.session.set({ affixai_signing_pdf: base64, affixai_signing_name: filename });
+      // Tell the content script to inject the signing overlay
+      await chrome.tabs.sendMessage(tab.id, { type: 'INJECT_SIGNING_OVERLAY' });
+      window.close();
+    } catch (err: any) {
+      setPdfMsg(err.message || 'Could not open signing overlay');
+      setPdfSigningLoading(false);
+    }
+  }
+
   async function handleSignOut() {
     await chrome.runtime.sendMessage({ type: 'CLEAR_TOKEN' });
     setAuth('login');
@@ -314,6 +344,8 @@ export default function Popup() {
             pdfUploading={pdfUploading}
             pdfMsg={pdfMsg}
             onPdfUpload={handlePdfUpload}
+            pdfSigningLoading={pdfSigningLoading}
+            onSignHere={handleSignHere}
           />
         )}
       </div>
@@ -398,6 +430,8 @@ function SignTab({
   pdfUploading: boolean;
   pdfMsg: string;
   onPdfUpload: (mode: 'edit' | 'auto') => void;
+  pdfSigningLoading: boolean;
+  onSignHere: () => void;
 }) {
   const pdfSection = isPdf && (
     <div className="rounded-xl border border-purple-100 bg-purple-50/60 p-3 space-y-2 mb-2">
@@ -405,17 +439,23 @@ function SignTab({
       <div className="flex gap-2">
         <button
           onClick={() => onPdfUpload('edit')}
-          disabled={pdfUploading}
+          disabled={pdfUploading || pdfSigningLoading}
           className="flex-1 py-2 rounded-lg bg-gradient-to-r from-purple-500 to-pink-500 text-white text-[11px] font-semibold hover:opacity-90 transition disabled:opacity-50">
           {pdfUploading ? 'Uploading…' : '✍️ Open in Affix AI'}
         </button>
         <button
           onClick={() => onPdfUpload('auto')}
-          disabled={pdfUploading}
+          disabled={pdfUploading || pdfSigningLoading}
           className="flex-1 py-2 rounded-lg border border-purple-200 text-purple-700 text-[11px] font-semibold hover:bg-purple-100 transition disabled:opacity-50">
           ⚡ Auto-sign
         </button>
       </div>
+      <button
+        onClick={onSignHere}
+        disabled={pdfUploading || pdfSigningLoading}
+        className="w-full py-2 rounded-lg border border-blue-200 bg-blue-50 text-blue-700 text-[11px] font-semibold hover:bg-blue-100 transition disabled:opacity-50">
+        {pdfSigningLoading ? 'Opening…' : '✏️ Sign here — draw & place inline'}
+      </button>
       {pdfMsg && <p className="text-[10px] text-red-600">{pdfMsg}</p>}
     </div>
   );

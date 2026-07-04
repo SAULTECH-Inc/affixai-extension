@@ -156,6 +156,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'INJECT_SIGNING_OVERLAY') {
+    injectSigningIframe();
+    sendResponse({ ok: true });
+    return true;
+  }
+
   if (msg.type !== 'FILL_FORM') return;
 
   const vault: VaultData = msg.vault;
@@ -300,6 +306,13 @@ const TOOLBOX_HTML = `
         <span class="bi">⚡</span>
         <span class="bl"><span class="bt">Auto-sign</span><span class="bs">Fill from vault &amp; sign instantly</span></span>
       </button>
+
+      <div class="divider" style="height:1px;background:#f0f0f0;margin:2px 0"></div>
+
+      <button class="btn s" id="b3" style="background:#f0f9ff;border-color:#bae6fd;color:#0369a1">
+        <span class="bi">✏️</span>
+        <span class="bl"><span class="bt">Sign here</span><span class="bs">Draw &amp; place signature inline</span></span>
+      </button>
     </div>
   </div>
 </div>`;
@@ -322,6 +335,7 @@ function injectPdfToolbox(): void {
   const st = shadow.getElementById('st')!;
   const b1 = shadow.getElementById('b1') as HTMLButtonElement;
   const b2 = shadow.getElementById('b2') as HTMLButtonElement;
+  const b3 = shadow.getElementById('b3') as HTMLButtonElement;
   let open = true;
 
   shadow.getElementById('tab')!.addEventListener('click', () => {
@@ -372,8 +386,68 @@ function injectPdfToolbox(): void {
     }
   }
 
+  async function openSigningOverlay() {
+    const auth: any = await chrome.runtime.sendMessage({ type: 'GET_AUTH_STATE' });
+    if (!auth?.authenticated) {
+      status('Sign in to AffixAI first — click the ✦ extension icon in the toolbar.', 'nf');
+      return;
+    }
+    busy(true);
+    status('Reading PDF…', 'ld');
+    try {
+      const base64 = await fetchPdfBase64();
+      const filename = getPdfFilename();
+      // Store bytes in session storage so the signing page can read them
+      await chrome.storage.session.set({
+        affixai_signing_pdf: base64,
+        affixai_signing_name: filename,
+      });
+      clearSt();
+      busy(false);
+      // Inject full-screen iframe overlay
+      injectSigningIframe();
+    } catch (err: any) {
+      const msg = err.message?.includes('Failed to fetch')
+        ? 'Cannot read this file. For local PDFs, enable "Allow access to file URLs" in Chrome → Extensions → AffixAI.'
+        : (err.message || 'Something went wrong.');
+      status(msg, 'er');
+      busy(false);
+    }
+  }
+
   b1.addEventListener('click', () => run('edit'));
   b2.addEventListener('click', () => run('auto'));
+  b3.addEventListener('click', () => openSigningOverlay());
+}
+
+function injectSigningIframe(): void {
+  // Remove any existing overlay
+  document.getElementById('affixai-signing-overlay')?.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'affixai-signing-overlay';
+  Object.assign(overlay.style, {
+    position: 'fixed', inset: '0', zIndex: '2147483646',
+    background: 'rgba(0,0,0,0.6)',
+  });
+
+  const iframe = document.createElement('iframe');
+  iframe.src = chrome.runtime.getURL('signing.html');
+  Object.assign(iframe.style, {
+    position: 'absolute', inset: '0',
+    width: '100%', height: '100%',
+    border: 'none',
+  });
+  overlay.appendChild(iframe);
+  document.documentElement.appendChild(overlay);
+
+  // Listen for the signing page to request close
+  window.addEventListener('message', function onClose(e: MessageEvent) {
+    if (e.data?.type === 'AFFIXAI_CLOSE_SIGNING') {
+      overlay.remove();
+      window.removeEventListener('message', onClose);
+    }
+  });
 }
 
 if (isPdfPage()) {
