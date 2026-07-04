@@ -86,6 +86,12 @@ interface PageInfo {
   renderedHeight: number;
 }
 
+interface VaultField {
+  key:   string;
+  label: string;
+  value: string;
+}
+
 const PALETTE: PaletteItem[] = [
   { id:'ph.text',      label:'Text',      kind:'text',      defaultValue:'',  width:160, height:18 },
   { id:'ph.number',    label:'Number',    kind:'number',    defaultValue:'',  width:80,  height:18 },
@@ -123,10 +129,12 @@ function relPos(e: React.MouseEvent|React.TouchEvent, el: HTMLElement) {
 
 export default function SigningPage() {
   const [pdfBytes,   setPdfBytes]   = useState<Uint8Array|null>(null);
+  const [pdfBase64,  setPdfBase64]  = useState<string|null>(null);   // kept for pdf-lib load
   const [pdfDoc,     setPdfDoc]     = useState<pdfjsLib.PDFDocumentProxy|null>(null);
   const [numPages,   setNumPages]   = useState(0);
   const [filename,   setFilename]   = useState('document.pdf');
   const [pageInfos,  setPageInfos]  = useState<PageInfo[]>([]);
+  const [vaultFields,setVaultFields]= useState<VaultField[]>([]);
 
   const [placements,   setPlacements]   = useState<Placement[]>([]);
   const [selectedIdx,  setSelectedIdx]  = useState<number|null>(null);
@@ -155,6 +163,7 @@ export default function SigningPage() {
   useEffect(() => {
     chrome.storage.session.get(['affixai_signing_pdf','affixai_signing_name'], (res) => {
       if (res.affixai_signing_pdf) {
+        setPdfBase64(res.affixai_signing_pdf);
         setPdfBytes(b64toBytes(res.affixai_signing_pdf));
         setFilename(res.affixai_signing_name || 'document.pdf');
       }
@@ -163,17 +172,37 @@ export default function SigningPage() {
     chrome.storage.local.get('affixai_token', async (res) => {
       const tok = res.affixai_token ?? null;
       if (!tok) return;
+
+      // Fetch default signature
       try {
         const r1 = await fetch(`${API_BASE}/signatures/default`, { headers:{ Authorization:`Bearer ${tok}` } });
-        if (!r1.ok) return;
-        const { id } = await r1.json();
-        const r2 = await fetch(`${API_BASE}/signatures/${id}/file`, { headers:{ Authorization:`Bearer ${tok}` } });
-        if (r2.ok) setSigUrl(URL.createObjectURL(await r2.blob()));
+        if (r1.ok) {
+          const { id } = await r1.json();
+          const r2 = await fetch(`${API_BASE}/signatures/${id}/file`, { headers:{ Authorization:`Bearer ${tok}` } });
+          if (r2.ok) setSigUrl(URL.createObjectURL(await r2.blob()));
+        }
       } catch { /* no saved sig */ }
+
+      // Fetch vault data
+      try {
+        const rv = await fetch(`${API_BASE}/data-vault/flat`, { headers:{ Authorization:`Bearer ${tok}` } });
+        if (rv.ok) {
+          const flat: Record<string,any> = await rv.json();
+          const fields: VaultField[] = Object.entries(flat)
+            .filter(([,v]) => v !== null && v !== undefined && String(v).trim() !== '')
+            .map(([k, v]) => ({
+              key: k,
+              label: k.replace(/_/g,' ').replace(/\b\w/g, (c:string) => c.toUpperCase()),
+              value: String(v),
+            }));
+          setVaultFields(fields);
+        }
+      } catch { /* vault unavailable */ }
     });
 
     const onMsg = (e: MessageEvent) => {
       if (e.data?.type === 'AFFIXAI_PDF_DATA') {
+        setPdfBase64(e.data.base64);
         setPdfBytes(b64toBytes(e.data.base64));
         setFilename(e.data.filename || 'document.pdf');
       }
@@ -343,11 +372,15 @@ export default function SigningPage() {
   // ── download ─────────────────────────────────────────────────────────────
 
   async function downloadSigned() {
-    if (!pdfBytes || placements.length === 0) return;
+    if (placements.length === 0) return;
+    // Prefer loading from the raw base64 string — pdf-lib handles this more
+    // reliably than a Uint8Array that may have gone through multiple hops.
+    const pdfSource = pdfBase64 ?? pdfBytes;
+    if (!pdfSource) return;
     setDownloading(true);
     setStatus(null);
     try {
-      const doc  = await PDFDocument.load(pdfBytes);
+      const doc  = await PDFDocument.load(pdfSource, { ignoreEncryption: true });
       const helv = await doc.embedFont(StandardFonts.Helvetica);
       const bold = await doc.embedFont(StandardFonts.HelveticaBold);
       const tiro = await doc.embedFont(StandardFonts.TimesRoman);
@@ -611,6 +644,7 @@ export default function SigningPage() {
                 defaults={defaults}
                 defaultsOpen={defaultsOpen}
                 sigUrl={sigUrl}
+                vaultFields={vaultFields}
                 onDefaultsToggle={() => setDefaultsOpen(v => !v)}
                 onDefaultsChange={updateDefaults}
                 onArm={armItem}
@@ -627,13 +661,14 @@ export default function SigningPage() {
 
 // ─── PalettePanel ────────────────────────────────────────────────────────────
 
-function PalettePanel({ placements, armedItem, defaults, defaultsOpen, sigUrl,
+function PalettePanel({ placements, armedItem, defaults, defaultsOpen, sigUrl, vaultFields,
   onDefaultsToggle, onDefaultsChange, onArm, onDisarm, onRedrawSig }: {
   placements:       Placement[];
   armedItem:        PaletteItem|null;
   defaults:         FontDefaults;
   defaultsOpen:     boolean;
   sigUrl:           string|null;
+  vaultFields:      VaultField[];
   onDefaultsToggle: () => void;
   onDefaultsChange: (v:FontDefaults) => void;
   onArm:            (item:PaletteItem) => void;
@@ -712,6 +747,55 @@ function PalettePanel({ placements, armedItem, defaults, defaultsOpen, sigUrl,
           );
         })}
       </div>
+
+      {/* Vault fields */}
+      {vaultFields.length > 0 && (
+        <>
+          <div style={{ fontSize:10, textTransform:'uppercase', letterSpacing:'0.08em',
+            color:C.fgSubtle, fontWeight:700, padding:'12px 0 6px' }}>
+            Your Data
+          </div>
+          <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+            {vaultFields.map((field) => {
+              const vItem: PaletteItem = {
+                id: `vault.${field.key}`,
+                label: field.label,
+                kind: 'text',
+                defaultValue: field.value,
+                width: Math.max(80, field.value.length * 7),
+                height: 18,
+              };
+              const isArmed = armedItem?.id === vItem.id;
+              return (
+                <div key={field.key} onClick={() => onArm(vItem)}
+                  style={{ padding:'8px 10px', borderRadius:10, cursor:'pointer',
+                    border:`1px solid ${isArmed ? `${C.brand500}60` : C.border}`,
+                    background: isArmed ? C.brandSoft : C.bgInset,
+                    boxShadow: isArmed ? `0 0 0 2px ${C.brand500}25` : undefined,
+                    display:'flex', alignItems:'center', gap:8, transition:'all 0.12s' }}>
+                  <div style={{ width:28, height:28, borderRadius:7, background:C.bgElevated,
+                    border:`1px solid ${C.border}`, display:'grid', placeItems:'center',
+                    flexShrink:0, fontSize:11, color:C.fgMuted }}>
+                    T
+                  </div>
+                  <div style={{ flex:1, minWidth:0 }}>
+                    <div style={{ fontSize:13, fontWeight:500, color:C.fg, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                      {field.label}
+                    </div>
+                    <div style={{ fontSize:11, color:C.fgMuted, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                      {field.value}
+                    </div>
+                  </div>
+                  {isArmed && (
+                    <span style={{ fontSize:10, textTransform:'uppercase', letterSpacing:'0.08em',
+                      color:C.brand400, fontWeight:700, flexShrink:0 }}>armed</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
     </>
   );
 }
