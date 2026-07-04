@@ -16,6 +16,40 @@ const API_BASE: string =
 
 const SIGN_BASE = 'https://affix-ai.com/sign';
 
+// Callback-based wrapper — the Promise form of sendMessage doesn't reliably
+// resolve when the receiver uses `return true` + async sendResponse (MV3).
+function send(msg: Record<string, unknown>): Promise<any> {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.runtime.sendMessage(msg, (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else {
+          resolve(response);
+        }
+      });
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+function sendToTab(tabId: number, msg: Record<string, unknown>): Promise<any> {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.tabs.sendMessage(tabId, msg, (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else {
+          resolve(response);
+        }
+      });
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
 type AuthState = 'loading' | 'terms' | 'login' | 'ready';
 type ActiveTab = 'fill' | 'sign';
 
@@ -93,7 +127,7 @@ export default function Popup() {
         throw new Error(body.detail || 'Login failed');
       }
       const { access_token } = await res.json();
-      await chrome.runtime.sendMessage({ type: 'SAVE_TOKEN', token: access_token });
+      await send({ type: 'SAVE_TOKEN', token: access_token });
       setPassword('');
       setAuth('ready');
     } catch (err: any) {
@@ -106,7 +140,7 @@ export default function Popup() {
     setFillResult(null);
     setError('');
     try {
-      const vault = await chrome.runtime.sendMessage({ type: 'FETCH_VAULT' });
+      const vault = await send({ type: 'FETCH_VAULT' });
       if (vault.error) throw new Error(vault.error);
 
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -117,15 +151,12 @@ export default function Popup() {
         files: ['content.js'],
       });
 
-      const response = await chrome.tabs.sendMessage(tab.id, {
-        type: 'FILL_FORM',
-        vault,
-      });
+      const response = await sendToTab(tab.id, { type: 'FILL_FORM', vault });
       setFillResult(response);
     } catch (err: any) {
       setError(err.message);
       if (err.message.includes('Session expired')) {
-        await chrome.runtime.sendMessage({ type: 'CLEAR_TOKEN' });
+        await send({ type: 'CLEAR_TOKEN' });
         setAuth('login');
       }
     } finally {
@@ -137,13 +168,13 @@ export default function Popup() {
     setDocsLoading(true);
     setError('');
     try {
-      const result = await chrome.runtime.sendMessage({ type: 'FETCH_PENDING_DOCS' });
-      if (result.error) throw new Error(result.error);
-      setDocs(result);
+      const result = await send({ type: 'FETCH_PENDING_DOCS' });
+      if (result?.error) throw new Error(result.error);
+      setDocs(Array.isArray(result) ? result : []);
     } catch (err: any) {
       setError(err.message);
       if (err.message.includes('Session expired')) {
-        await chrome.runtime.sendMessage({ type: 'CLEAR_TOKEN' });
+        await send({ type: 'CLEAR_TOKEN' });
         setAuth('login');
       }
     } finally {
@@ -170,15 +201,16 @@ export default function Popup() {
       // Ask the content script to fetch the PDF bytes
       let base64: string;
       try {
-        base64 = await chrome.tabs.sendMessage(tab.id, { type: 'FETCH_PDF_BASE64' });
+        base64 = await sendToTab(tab.id, { type: 'FETCH_PDF_BASE64' });
       } catch {
         // Content script not ready — inject it first
         await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
-        base64 = await chrome.tabs.sendMessage(tab.id, { type: 'FETCH_PDF_BASE64' });
+        base64 = await sendToTab(tab.id, { type: 'FETCH_PDF_BASE64' });
       }
+      if ((base64 as any)?.error) throw new Error((base64 as any).error);
 
       const filename = (tab.url || 'document.pdf').split('/').pop()?.split('?')[0] || 'document.pdf';
-      const result = await chrome.runtime.sendMessage({ type: 'UPLOAD_PDF_BYTES', base64, filename });
+      const result = await send({ type: 'UPLOAD_PDF_BYTES', base64, filename });
       if (result?.error) throw new Error(result.error);
       const id = result?.document_id || result?.id;
       if (!id) throw new Error('Upload returned no document ID');
@@ -204,18 +236,16 @@ export default function Popup() {
       // Fetch PDF bytes via content script
       let base64: string;
       try {
-        base64 = await chrome.tabs.sendMessage(tab.id, { type: 'FETCH_PDF_BASE64' });
+        base64 = await sendToTab(tab.id, { type: 'FETCH_PDF_BASE64' });
       } catch {
         await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
-        base64 = await chrome.tabs.sendMessage(tab.id, { type: 'FETCH_PDF_BASE64' });
+        base64 = await sendToTab(tab.id, { type: 'FETCH_PDF_BASE64' });
       }
       if ((base64 as any)?.error) throw new Error((base64 as any).error);
 
       const filename = (tab.url || 'document.pdf').split('/').pop()?.split('?')[0] || 'document.pdf';
-      // Store in session storage for the signing iframe to read
       await chrome.storage.session.set({ affixai_signing_pdf: base64, affixai_signing_name: filename });
-      // Tell the content script to inject the signing overlay
-      await chrome.tabs.sendMessage(tab.id, { type: 'INJECT_SIGNING_OVERLAY' });
+      await sendToTab(tab.id, { type: 'INJECT_SIGNING_OVERLAY' });
       window.close();
     } catch (err: any) {
       setPdfMsg(err.message || 'Could not open signing overlay');
@@ -224,7 +254,7 @@ export default function Popup() {
   }
 
   async function handleSignOut() {
-    await chrome.runtime.sendMessage({ type: 'CLEAR_TOKEN' });
+    await send({ type: 'CLEAR_TOKEN' });
     setAuth('login');
     setDocs(null);
     setFillResult(null);
@@ -420,6 +450,8 @@ function SignTab({
   pdfUploading,
   pdfMsg,
   onPdfUpload,
+  pdfSigningLoading,
+  onSignHere,
 }: {
   docs: PendingDoc[] | null;
   loading: boolean;

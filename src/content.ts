@@ -203,11 +203,37 @@ function isPdfPage(): boolean {
 }
 
 async function fetchPdfBase64(): Promise<string> {
-  const resp = await fetch(window.location.href);
-  if (!resp.ok) throw new Error(`Could not read the PDF (${resp.status})`);
-  const buf = await resp.arrayBuffer();
+  const url = window.location.href;
+  let buf: ArrayBuffer;
+
+  if (url.startsWith('file://')) {
+    // fetch() does not support file:// even with "Allow access to file URLs".
+    // Use XMLHttpRequest which works for local files.
+    buf = await new Promise<ArrayBuffer>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.responseType = 'arraybuffer';
+      xhr.onload = () => {
+        // XHR to file:// returns status 0 on success (no HTTP status code).
+        if (xhr.status === 0 || xhr.status === 200) {
+          resolve(xhr.response as ArrayBuffer);
+        } else {
+          reject(new Error(`Could not read the file (${xhr.status})`));
+        }
+      };
+      xhr.onerror = () =>
+        reject(new Error(
+          'Cannot read this local PDF. Enable "Allow access to file URLs" in Chrome → Extensions → AffixAI.'
+        ));
+      xhr.send();
+    });
+  } else {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`Could not read the PDF (${resp.status})`);
+    buf = await resp.arrayBuffer();
+  }
+
   const bytes = new Uint8Array(buf);
-  // Chunk to avoid call-stack limits on large files.
   let binary = '';
   const CHUNK = 8192;
   for (let i = 0; i < bytes.byteLength; i += CHUNK) {
@@ -512,6 +538,4 @@ function injectSigningIframe(): void {
   });
 }
 
-if (isPdfPage()) {
-  injectPdfToolbox();
-}
+// Floating toolbox disabled — PDF controls live in the popup instead.
