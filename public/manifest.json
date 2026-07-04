@@ -39,6 +39,12 @@
     "https://affixai-backend.vercel.app/*",
     "<all_urls>"
   ],
+  "web_accessible_resources": [
+    {
+      "resources": ["signing.html", "signing.js", "client.js", "popup.css"],
+      "matches": ["<all_urls>"]
+    }
+  ],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
   }
