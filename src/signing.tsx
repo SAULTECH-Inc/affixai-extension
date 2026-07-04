@@ -43,7 +43,7 @@ const COLOR_PRESETS = ['#000000','#1e3a8a','#7e22ce','#dc2626','#0f766e','#a1620
 
 // ─── types ───────────────────────────────────────────────────────────────────
 
-type PlacementKind = 'text'|'number'|'date'|'time'|'signature'|'initials';
+type PlacementKind = 'text'|'number'|'date'|'time'|'signature'|'initials'|'photo';
 
 interface Placement {
   id:          string;
@@ -93,16 +93,17 @@ interface VaultField {
 }
 
 const PALETTE: PaletteItem[] = [
-  { id:'ph.text',      label:'Text',      kind:'text',      defaultValue:'',  width:160, height:18 },
-  { id:'ph.number',    label:'Number',    kind:'number',    defaultValue:'',  width:80,  height:18 },
-  { id:'ph.date',      label:'Date',      kind:'date',      defaultValue:'',  width:100, height:18 },
-  { id:'ph.time',      label:'Time',      kind:'time',      defaultValue:'',  width:70,  height:18 },
-  { id:'ph.signature', label:'Signature', kind:'signature', defaultValue:'',  width:180, height:40 },
-  { id:'ph.initials',  label:'Initials',  kind:'initials',  defaultValue:'',  width:80,  height:18 },
+  { id:'ph.text',      label:'Text',           kind:'text',      defaultValue:'',  width:160, height:18  },
+  { id:'ph.number',    label:'Number',          kind:'number',    defaultValue:'',  width:80,  height:18  },
+  { id:'ph.date',      label:'Date',            kind:'date',      defaultValue:'',  width:100, height:18  },
+  { id:'ph.time',      label:'Time',            kind:'time',      defaultValue:'',  width:70,  height:18  },
+  { id:'ph.signature', label:'Signature',       kind:'signature', defaultValue:'',  width:180, height:40  },
+  { id:'ph.photo',     label:'Passport Photo',  kind:'photo',     defaultValue:'',  width:100, height:130 },
+  { id:'ph.initials',  label:'Initials',        kind:'initials',  defaultValue:'',  width:80,  height:18  },
 ];
 
 const ICONS: Record<PlacementKind, string> = {
-  text:'T', number:'#', date:'📅', time:'⏰', signature:'✍', initials:'Ab',
+  text:'T', number:'#', date:'📅', time:'⏰', signature:'✍', photo:'📷', initials:'Ab',
 };
 
 function uid() { return Math.random().toString(36).slice(2); }
@@ -144,6 +145,7 @@ export default function SigningPage() {
   });
 
   const [sigUrl,       setSigUrl]       = useState<string|null>(null);
+  const [photoUrl,     setPhotoUrl]     = useState<string|null>(null);
   const [drawingOpen,  setDrawingOpen]  = useState(false);
   const [downloading,  setDownloading]  = useState(false);
   const [status,       setStatus]       = useState<{msg:string;type:'ok'|'err'}|null>(null);
@@ -182,6 +184,16 @@ export default function SigningPage() {
           if (r2.ok) setSigUrl(URL.createObjectURL(await r2.blob()));
         }
       } catch { /* no saved sig */ }
+
+      // Fetch default passport photo
+      try {
+        const p1 = await fetch(`${API_BASE}/passport-photos/default`, { headers:{ Authorization:`Bearer ${tok}` } });
+        if (p1.ok) {
+          const { id } = await p1.json();
+          const p2 = await fetch(`${API_BASE}/passport-photos/${id}/file`, { headers:{ Authorization:`Bearer ${tok}` } });
+          if (p2.ok) setPhotoUrl(URL.createObjectURL(await p2.blob()));
+        }
+      } catch { /* no saved photo */ }
 
       // Fetch vault data
       try {
@@ -296,6 +308,10 @@ export default function SigningPage() {
   function armItem(item: PaletteItem) {
     if (armedItem?.id === item.id) { setArmedItem(null); return; }
     if (item.kind === 'signature' && !sigUrl) { setDrawingOpen(true); return; }
+    if (item.kind === 'photo' && !photoUrl) {
+      setStatus({ msg: 'No passport photo saved yet. Upload one on the AffixAI dashboard first.', type: 'err' });
+      return;
+    }
     setArmedItem(item);
     setSelectedIdx(null);
   }
@@ -400,9 +416,11 @@ export default function SigningPage() {
         const pdfX = p.x;
         const pdfY = pH - p.y - p.height; // flip Y (PDF origin = bottom-left)
 
-        if (p.kind === 'signature' && sigUrl) {
+        if (p.kind === 'signature' || p.kind === 'photo') {
+          const imgSrc = p.kind === 'signature' ? sigUrl : photoUrl;
+          if (!imgSrc) continue;
           try {
-            const bytes = await fetch(sigUrl).then(r => r.arrayBuffer());
+            const bytes = await fetch(imgSrc).then(r => r.arrayBuffer());
             let img;
             try { img = await doc.embedPng(bytes); } catch { img = await doc.embedJpg(bytes); }
             pg.drawImage(img, { x:pdfX, y:pdfY, width:p.width, height:p.height });
@@ -556,7 +574,7 @@ export default function SigningPage() {
 
                   {pagePlacements.map(({ p, idx: globalIdx }) => {
                     const isSelected  = selectedIdx === globalIdx;
-                    const isImgKind   = p.kind === 'signature';
+                    const isImgKind   = p.kind === 'signature' || p.kind === 'photo';
                     const left  = p.x * ratio;
                     const top   = p.y * ratio;
                     const w     = p.width  * ratio;
@@ -595,7 +613,13 @@ export default function SigningPage() {
                                   style={{ maxWidth:'100%', maxHeight:'100%', objectFit:'contain', pointerEvents:'none', display:'block' }} />
                               : <span style={{ color:C.danger, fontStyle:'italic', fontSize:12 }}>No signature saved</span>
                           )}
-                          {p.kind!=='signature' && (
+                          {p.kind==='photo' && (
+                            photoUrl
+                              ? <img src={photoUrl} alt="photo" draggable={false}
+                                  style={{ width:'100%', height:'100%', objectFit:'cover', pointerEvents:'none', display:'block' }} />
+                              : <span style={{ color:C.danger, fontStyle:'italic', fontSize:12 }}>No photo saved</span>
+                          )}
+                          {p.kind!=='signature' && p.kind!=='photo' && (
                             <input
                               type={p.kind==='number'?'number':p.kind==='date'?'date':p.kind==='time'?'time':'text'}
                               value={p.value}
@@ -644,6 +668,7 @@ export default function SigningPage() {
                 defaults={defaults}
                 defaultsOpen={defaultsOpen}
                 sigUrl={sigUrl}
+                photoUrl={photoUrl}
                 vaultFields={vaultFields}
                 onDefaultsToggle={() => setDefaultsOpen(v => !v)}
                 onDefaultsChange={updateDefaults}
@@ -661,13 +686,14 @@ export default function SigningPage() {
 
 // ─── PalettePanel ────────────────────────────────────────────────────────────
 
-function PalettePanel({ placements, armedItem, defaults, defaultsOpen, sigUrl, vaultFields,
+function PalettePanel({ placements, armedItem, defaults, defaultsOpen, sigUrl, photoUrl, vaultFields,
   onDefaultsToggle, onDefaultsChange, onArm, onDisarm, onRedrawSig }: {
   placements:       Placement[];
   armedItem:        PaletteItem|null;
   defaults:         FontDefaults;
   defaultsOpen:     boolean;
   sigUrl:           string|null;
+  photoUrl:         string|null;
   vaultFields:      VaultField[];
   onDefaultsToggle: () => void;
   onDefaultsChange: (v:FontDefaults) => void;
@@ -709,8 +735,10 @@ function PalettePanel({ placements, armedItem, defaults, defaultsOpen, sigUrl, v
 
       <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
         {PALETTE.map((item) => {
-          const isArmed = armedItem?.id === item.id;
-          const isSig   = item.kind === 'signature';
+          const isArmed   = armedItem?.id === item.id;
+          const isSig     = item.kind === 'signature';
+          const isPhoto   = item.kind === 'photo';
+          const hasImg    = isSig ? !!sigUrl : isPhoto ? !!photoUrl : true;
           return (
             <div key={item.id} onClick={() => onArm(item)}
               style={{ padding:'8px 10px', borderRadius:10, cursor:'pointer',
@@ -725,10 +753,12 @@ function PalettePanel({ placements, armedItem, defaults, defaultsOpen, sigUrl, v
               </div>
               <div style={{ flex:1, minWidth:0 }}>
                 <div style={{ fontSize:13, fontWeight:500, color:C.fg }}>{item.label}</div>
-                {isSig && !sigUrl && (
-                  <div style={{ fontSize:11, color:C.fgSubtle }}>Click to draw signature</div>
+                {(isSig || isPhoto) && !hasImg && (
+                  <div style={{ fontSize:11, color:C.fgSubtle }}>
+                    {isSig ? 'Click to draw signature' : 'Upload photo on dashboard first'}
+                  </div>
                 )}
-                {isSig && sigUrl && (
+                {(isSig || isPhoto) && hasImg && (
                   <div style={{ fontSize:11, color:C.success }}>✓ Ready</div>
                 )}
               </div>
@@ -736,7 +766,7 @@ function PalettePanel({ placements, armedItem, defaults, defaultsOpen, sigUrl, v
                 <span style={{ fontSize:10, textTransform:'uppercase', letterSpacing:'0.08em',
                   color:C.brand400, fontWeight:700, flexShrink:0 }}>armed</span>
               )}
-              {isSig && sigUrl && !isArmed && (
+              {isSig && hasImg && !isArmed && (
                 <button onClick={(e) => { e.stopPropagation(); onRedrawSig(); }}
                   style={{ fontSize:10, color:C.fgMuted, padding:'2px 6px', borderRadius:4,
                     border:`1px solid ${C.border}`, background:C.bgElevated, cursor:'pointer', flexShrink:0 }}>
@@ -864,7 +894,7 @@ function FontControls({ placement:p, onChange, onDeselect }: {
   onChange:  (ch:Partial<Placement>) => void;
   onDeselect:() => void;
 }) {
-  const isText = !['signature'].includes(p.kind);
+  const isText = !['signature','photo'].includes(p.kind);
   return (
     <div>
       <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', marginBottom:12 }}>
@@ -884,7 +914,7 @@ function FontControls({ placement:p, onChange, onDeselect }: {
       {!isText ? (
         <p style={{ fontSize:12, color:C.fgMuted, padding:'10px 12px', borderRadius:10,
           background:C.bgInset, border:`1px solid ${C.border}`, margin:0 }}>
-          Signature placement. Drag to reposition on the PDF.
+          {p.kind === 'photo' ? 'Passport photo' : 'Signature'} placement. Drag to reposition on the PDF.
         </p>
       ) : (
         <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
