@@ -576,3 +576,29 @@ function injectSigningIframe(): void {
 if (isPdfPage()) {
   injectPdfToolbox();
 }
+
+// Auto-sync auth token from the AffixAI dashboard into extension storage.
+// When the user is logged into affix-ai.com the content script can read the
+// JWT from the page's localStorage and forward it to the background so the
+// signing overlay (and popup) can make authenticated API calls without
+// requiring the user to log in a second time through the extension popup.
+(function syncDashboardToken() {
+  const host = window.location.hostname;
+  if (!host.includes('affix-ai.com') && !host.includes('localhost')) return;
+
+  const raw =
+    localStorage.getItem('access_token') ||
+    localStorage.getItem('accessToken') ||
+    localStorage.getItem('affixai_token') || '';
+
+  if (!raw) return;
+  // Strip surrounding JSON quotes if the app stored it stringified.
+  const token = raw.replace(/^"|"$/g, '');
+  if (!token || token === 'null' || token === 'undefined') return;
+
+  chrome.runtime.sendMessage({ type: 'SAVE_TOKEN', token }, () => {
+    // Ignore chrome.runtime.lastError — if the background is idle it will
+    // wake up and handle this the next time it's needed.
+    void chrome.runtime.lastError;
+  });
+})();
