@@ -150,6 +150,11 @@ export default function SigningPage() {
   const [downloading,  setDownloading]  = useState(false);
   const [status,       setStatus]       = useState<{msg:string;type:'ok'|'err'}|null>(null);
   const [defaultsOpen, setDefaultsOpen] = useState(false);
+  const [sourceOpen,   setSourceOpen]   = useState(false);
+  const [sourceTab,    setSourceTab]    = useState<'local'|'url'|'drive'|'dropbox'>('local');
+  const [cloudUrl,     setCloudUrl]     = useState('');
+  const [cloudLoading, setCloudLoading] = useState(false);
+  const [cloudErr,     setCloudErr]     = useState<string|null>(null);
 
   const canvasRefs   = useRef<Map<number,HTMLCanvasElement>>(new Map());
   const pageInfosRef = useRef<PageInfo[]>([]);
@@ -157,6 +162,7 @@ export default function SigningPage() {
   const drawPadRef   = useRef<HTMLCanvasElement>(null);
   const isDrawingRef = useRef(false);
   const lastXYRef    = useRef({x:0,y:0});
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => { pageInfosRef.current = pageInfos; }, [pageInfos]);
 
@@ -225,7 +231,7 @@ export default function SigningPage() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { setArmedItem(null); setDrawingOpen(false); }
+      if (e.key === 'Escape') { setArmedItem(null); setDrawingOpen(false); setSourceOpen(false); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -385,6 +391,75 @@ export default function SigningPage() {
     setArmedItem(PALETTE.find(p => p.kind === 'signature')!);
   }
 
+  // ── cloud / local file open ───────────────────────────────────────────────
+
+  function bytesToBase64(bytes: Uint8Array): string {
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+
+  function openPdfBytes(bytes: Uint8Array, name: string) {
+    if (bytes[0] !== 0x25 || bytes[1] !== 0x50 || bytes[2] !== 0x44 || bytes[3] !== 0x46) {
+      setStatus({ msg: 'Not a valid PDF file.', type: 'err' });
+      return;
+    }
+    const b64 = bytesToBase64(bytes);
+    setPdfBase64(b64);
+    setPdfBytes(bytes);
+    setFilename(name.endsWith('.pdf') ? name : name + '.pdf');
+    setPlacements([]);
+    setSelectedIdx(null);
+    setArmedItem(null);
+    setSourceOpen(false);
+    setCloudUrl('');
+    setCloudErr(null);
+  }
+
+  function handleLocalFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      if (ev.target?.result instanceof ArrayBuffer) openPdfBytes(new Uint8Array(ev.target.result), file.name);
+    };
+    reader.readAsArrayBuffer(file);
+    e.target.value = '';
+  }
+
+  function normalizeCloudUrl(raw: string): string {
+    const url = raw.trim();
+    // Google Drive share link → direct download
+    const gm = url.match(/drive\.google\.com\/(?:file\/d\/|open\?id=)([a-zA-Z0-9_-]+)/);
+    if (gm) return `https://drive.google.com/uc?export=download&id=${gm[1]}&confirm=t`;
+    // Dropbox share link → direct download
+    if (/dropbox\.com\/(s|scl)\//.test(url)) return url.split('?')[0] + '?dl=1';
+    return url;
+  }
+
+  async function fetchCloudPdf() {
+    const raw = cloudUrl.trim();
+    if (!raw) return;
+    setCloudLoading(true);
+    setCloudErr(null);
+    try {
+      const url = normalizeCloudUrl(raw);
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status} — check the file is shared publicly.`);
+      const buf = await r.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      if (bytes[0] !== 0x25 || bytes[1] !== 0x50) {
+        throw new Error('The link did not return a valid PDF. Make sure the file is publicly shared and the link is correct.');
+      }
+      const guessName = decodeURIComponent(url.split('/').pop()?.split('?')[0] || 'document');
+      openPdfBytes(bytes, guessName.includes('.') ? guessName : 'document.pdf');
+    } catch (err: any) {
+      setCloudErr(err.message);
+    } finally {
+      setCloudLoading(false);
+    }
+  }
+
   // ── download ─────────────────────────────────────────────────────────────
 
   async function downloadSigned() {
@@ -462,6 +537,120 @@ export default function SigningPage() {
     <div style={{ display:'flex', flexDirection:'column', height:'100vh', background:C.bgInset,
       color:C.fg, fontFamily:'system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', fontSize:14 }}>
 
+      {/* Hidden file input for local PDF picking */}
+      <input ref={fileInputRef} type="file" accept=".pdf,application/pdf"
+        style={{ display:'none' }} onChange={handleLocalFile} />
+
+      {/* Source picker modal */}
+      {sourceOpen && (
+        <div style={{ position:'fixed', inset:0, zIndex:200, background:'rgba(0,0,0,0.55)',
+          backdropFilter:'blur(4px)', display:'flex', alignItems:'center', justifyContent:'center' }}
+          onClick={() => setSourceOpen(false)}>
+          <div style={{ background:C.bgElevated, borderRadius:16, padding:24, width:480,
+            maxWidth:'94vw', border:`1px solid ${C.border}`, boxShadow:'0 24px 64px rgba(0,0,0,0.3)' }}
+            onClick={(e) => e.stopPropagation()}>
+
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:16 }}>
+              <h3 style={{ fontSize:16, fontWeight:700, color:C.fg, margin:0 }}>Open PDF</h3>
+              <button onClick={() => setSourceOpen(false)}
+                style={{ width:28, height:28, borderRadius:8, border:`1px solid ${C.border}`,
+                  background:'transparent', color:C.fgMuted, cursor:'pointer',
+                  display:'grid', placeItems:'center', fontSize:14 }}>✕</button>
+            </div>
+
+            {/* Source tabs */}
+            <div style={{ display:'flex', gap:4, marginBottom:16 }}>
+              {([
+                { id:'local',   label:'📁 Device'  },
+                { id:'url',     label:'🔗 URL'     },
+                { id:'drive',   label:'🟢 Drive'   },
+                { id:'dropbox', label:'📦 Dropbox' },
+              ] as const).map(s => (
+                <button key={s.id}
+                  onClick={() => { setSourceTab(s.id); setCloudErr(null); }}
+                  style={{ flex:1, height:34, borderRadius:8, fontSize:12,
+                    fontWeight: sourceTab===s.id ? 600 : 400, cursor:'pointer',
+                    border:`1px solid ${sourceTab===s.id?`${C.brand500}60`:C.border}`,
+                    background: sourceTab===s.id ? C.brandSoft : 'transparent',
+                    color: sourceTab===s.id ? C.fg : C.fgMuted }}>
+                  {s.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Device tab */}
+            {sourceTab==='local' && (
+              <div style={{ textAlign:'center', padding:'28px 0' }}>
+                <button onClick={() => fileInputRef.current?.click()}
+                  style={{ padding:'14px 32px', borderRadius:12,
+                    border:`1.5px dashed ${C.borderStrong}`, background:C.bgInset,
+                    color:C.fg, fontSize:14, fontWeight:500, cursor:'pointer' }}>
+                  📁 Choose PDF from device
+                </button>
+                <p style={{ fontSize:12, color:C.fgMuted, marginTop:12 }}>
+                  Supports any PDF file from your computer.
+                </p>
+              </div>
+            )}
+
+            {/* URL / Drive / Dropbox tabs */}
+            {(sourceTab==='url' || sourceTab==='drive' || sourceTab==='dropbox') && (
+              <div>
+                {sourceTab==='drive' && (
+                  <div style={{ padding:'10px 12px', borderRadius:10, background:'#f0fdf4',
+                    border:'1px solid #bbf7d0', fontSize:12, color:'#166534', marginBottom:12 }}>
+                    <strong>How to share:</strong> Open in Google Drive → Share → "Anyone with the link" → Copy link, then paste below.
+                  </div>
+                )}
+                {sourceTab==='dropbox' && (
+                  <div style={{ padding:'10px 12px', borderRadius:10, background:'#eff6ff',
+                    border:'1px solid #bfdbfe', fontSize:12, color:'#1d4ed8', marginBottom:12 }}>
+                    <strong>How to share:</strong> Open in Dropbox → Share → Copy Link, then paste below.
+                  </div>
+                )}
+                {sourceTab==='url' && (
+                  <p style={{ fontSize:12, color:C.fgMuted, marginBottom:12 }}>
+                    Paste a direct link to any publicly accessible PDF.
+                  </p>
+                )}
+
+                <input type="url" value={cloudUrl}
+                  onChange={(e) => { setCloudUrl(e.target.value); setCloudErr(null); }}
+                  onKeyDown={(e) => { if (e.key==='Enter') fetchCloudPdf(); }}
+                  placeholder={
+                    sourceTab==='drive'   ? 'https://drive.google.com/file/d/…' :
+                    sourceTab==='dropbox' ? 'https://www.dropbox.com/s/…' :
+                                           'https://example.com/document.pdf'
+                  }
+                  style={{ width:'100%', height:40, padding:'0 12px', borderRadius:10,
+                    border:`1px solid ${cloudErr?C.danger:C.border}`, background:C.bgInset,
+                    fontSize:13, color:C.fg, boxSizing:'border-box', outline:'none',
+                    display:'block', marginBottom:cloudErr?6:12 }}
+                />
+
+                {cloudErr && (
+                  <p style={{ fontSize:12, color:C.danger, margin:'0 0 10px' }}>{cloudErr}</p>
+                )}
+
+                <button onClick={fetchCloudPdf}
+                  disabled={!cloudUrl.trim() || cloudLoading}
+                  style={{ width:'100%', height:40, borderRadius:10, border:'none',
+                    background: !cloudUrl.trim() ? C.bgInset : C.brandGrad,
+                    color: !cloudUrl.trim() ? C.fgSubtle : '#fff',
+                    fontSize:13, fontWeight:600,
+                    cursor: !cloudUrl.trim() ? 'not-allowed' : 'pointer',
+                    opacity: cloudLoading ? 0.6 : 1 }}>
+                  {cloudLoading ? '⏳ Fetching PDF…' :
+                    sourceTab==='drive'   ? '🟢 Open from Google Drive' :
+                    sourceTab==='dropbox' ? '📦 Open from Dropbox' :
+                                           '🔗 Open PDF from URL'}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Drawing modal */}
       {drawingOpen && (
         <div style={{ position:'fixed', inset:0, zIndex:200, background:'rgba(0,0,0,0.55)',
@@ -511,6 +700,11 @@ export default function SigningPage() {
             <div style={{ fontWeight:700, fontSize:14, lineHeight:1, color:C.fg }}>Sign Document</div>
             <div style={{ fontSize:11, color:C.fgMuted, marginTop:2 }}>{filename}</div>
           </div>
+          <button onClick={() => setSourceOpen(true)}
+            style={{ padding:'4px 10px', borderRadius:8, border:`1px solid ${C.border}`,
+              background:C.bgInset, color:C.fgMuted, fontSize:12, cursor:'pointer', flexShrink:0 }}>
+            📂 Open
+          </button>
         </div>
         <div style={{ display:'flex', gap:8, alignItems:'center' }}>
           <button onClick={downloadSigned} disabled={placements.length===0||downloading}
@@ -548,8 +742,25 @@ export default function SigningPage() {
 
           {pageInfos.length===0 && (
             <div style={{ color:C.fgSubtle, marginTop:80, textAlign:'center' }}>
-              {pdfBytes ? <div><div style={{ fontSize:28 }}>⏳</div><div style={{ marginTop:8 }}>Rendering PDF…</div></div>
-                        : <div><div style={{ fontSize:28 }}>📄</div><div style={{ marginTop:8 }}>Loading PDF…</div></div>}
+              {pdfBytes ? (
+                <div>
+                  <div style={{ fontSize:28 }}>⏳</div>
+                  <div style={{ marginTop:8 }}>Rendering PDF…</div>
+                </div>
+              ) : (
+                <div>
+                  <div style={{ fontSize:48, marginBottom:12 }}>📄</div>
+                  <div style={{ fontSize:15, fontWeight:600, color:C.fg, marginBottom:6 }}>No document loaded</div>
+                  <div style={{ fontSize:13, color:C.fgMuted, marginBottom:20 }}>
+                    Open a PDF from your device or cloud storage
+                  </div>
+                  <button onClick={() => setSourceOpen(true)}
+                    style={{ padding:'10px 24px', borderRadius:10, border:'none',
+                      background:C.brandGrad, color:'#fff', fontSize:13, fontWeight:600, cursor:'pointer' }}>
+                    📂 Open PDF
+                  </button>
+                </div>
+              )}
             </div>
           )}
 

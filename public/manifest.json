@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AffixAI — Auto-fill forms",
   "short_name": "AffixAI",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Auto-fill forms from your AffixAI vault. Smart field matching by name & label. Sign documents in one click. PDF toolbox on any PDF.",
   "icons": {
     "16":  "icons/icon16.png",
