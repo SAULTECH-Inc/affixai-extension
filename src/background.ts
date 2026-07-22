@@ -8,6 +8,53 @@ const API_BASE: string =
   (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_URL) ||
   'https://affixai-backend.vercel.app/api/v1';
 
+// ── Cloud picker state ────────────────────────────────────────────────────────
+let cloudPickerWindowId: number | null = null;
+let cloudPickerSource: 'drive' | 'dropbox' | null = null;
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (cloudPickerWindowId === null || cloudPickerSource === null) return;
+  if (tab.windowId !== cloudPickerWindowId) return;
+  if (changeInfo.status !== 'complete') return;
+
+  const url = tab.url || '';
+  let fileUrl: string | null = null;
+  let filename = 'document.pdf';
+
+  if (cloudPickerSource === 'drive') {
+    // Detect when user opens a file: drive.google.com/file/d/FILE_ID/...
+    const m = url.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/);
+    if (m) {
+      fileUrl = `https://drive.google.com/uc?export=download&id=${m[1]}&confirm=t`;
+      const raw = (tab.title || 'document').replace(/ - Google Drive$/, '').trim();
+      filename = raw.endsWith('.pdf') ? raw : raw + '.pdf';
+    }
+  } else if (cloudPickerSource === 'dropbox') {
+    // Detect when user opens a file: dropbox.com/s/... or dropbox.com/scl/...
+    if (/dropbox\.com\/(s|scl)\//.test(url)) {
+      fileUrl = url.split('?')[0] + '?dl=1';
+      const raw = decodeURIComponent(url.split('/').pop()?.split('?')[0] || 'document.pdf');
+      filename = raw.endsWith('.pdf') ? raw : 'document.pdf';
+    }
+  }
+
+  if (fileUrl) {
+    chrome.storage.session.set({ affixai_cloud_file: { url: fileUrl, filename } });
+    const wid = cloudPickerWindowId;
+    cloudPickerWindowId = null;
+    cloudPickerSource = null;
+    chrome.windows.remove(wid, () => { void chrome.runtime.lastError; });
+  }
+});
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  if (windowId === cloudPickerWindowId) {
+    cloudPickerWindowId = null;
+    cloudPickerSource = null;
+    chrome.storage.session.set({ affixai_cloud_picker_cancelled: true });
+  }
+});
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'FETCH_VAULT') {
     handleFetchVault().then(sendResponse).catch((err) =>
@@ -53,6 +100,29 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg.type === 'OPEN_TAB') {
     chrome.tabs.create({ url: msg.url });
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'OPEN_CLOUD_PICKER') {
+    cloudPickerSource = msg.source as 'drive' | 'dropbox';
+    const url = msg.source === 'drive' ? 'https://drive.google.com' : 'https://www.dropbox.com';
+    if (cloudPickerWindowId !== null) {
+      chrome.windows.remove(cloudPickerWindowId, () => { void chrome.runtime.lastError; });
+    }
+    chrome.windows.create({ url, type: 'popup', width: 960, height: 700 }, (win) => {
+      cloudPickerWindowId = win?.id ?? null;
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
+
+  if (msg.type === 'CANCEL_CLOUD_PICKER') {
+    if (cloudPickerWindowId !== null) {
+      chrome.windows.remove(cloudPickerWindowId, () => { void chrome.runtime.lastError; });
+      cloudPickerWindowId = null;
+    }
+    cloudPickerSource = null;
     sendResponse({ ok: true });
     return true;
   }

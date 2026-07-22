@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AffixAI — Auto-fill forms",
   "short_name": "AffixAI",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Auto-fill forms from your AffixAI vault. Smart field matching by name & label. Sign documents in one click. PDF toolbox on any PDF.",
   "icons": {
     "16":  "icons/icon16.png",
@@ -33,7 +33,8 @@
     "storage",
     "activeTab",
     "scripting",
-    "tabs"
+    "tabs",
+    "windows"
   ],
   "host_permissions": [
     "https://affixai-backend.vercel.app/*",

@@ -155,6 +155,7 @@ export default function SigningPage() {
   const [cloudUrl,     setCloudUrl]     = useState('');
   const [cloudLoading, setCloudLoading] = useState(false);
   const [cloudErr,     setCloudErr]     = useState<string|null>(null);
+  const [cloudPickerActive, setCloudPickerActive] = useState(false);
 
   const canvasRefs   = useRef<Map<number,HTMLCanvasElement>>(new Map());
   const pageInfosRef = useRef<PageInfo[]>([]);
@@ -226,12 +227,51 @@ export default function SigningPage() {
       }
     };
     window.addEventListener('message', onMsg);
-    return () => window.removeEventListener('message', onMsg);
+
+    // Listen for cloud picker result set by background service worker
+    const onStorageChange = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+      if (area !== 'session') return;
+
+      if (changes.affixai_cloud_picker_cancelled?.newValue) {
+        setCloudPickerActive(false);
+        chrome.storage.session.remove('affixai_cloud_picker_cancelled');
+        return;
+      }
+
+      if (!changes.affixai_cloud_file?.newValue) return;
+      const { url, filename: fname } = changes.affixai_cloud_file.newValue as { url: string; filename: string };
+      chrome.storage.session.remove('affixai_cloud_file');
+      setCloudPickerActive(false);
+      setCloudLoading(true);
+      setCloudErr(null);
+      fetch(url, { credentials: 'include' })
+        .then(async (r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status} — the file may not be publicly accessible.`);
+          const buf = await r.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          if (bytes[0] !== 0x25 || bytes[1] !== 0x50) {
+            throw new Error('The file could not be accessed. Make sure it is shared with "Anyone with the link".');
+          }
+          openPdfBytes(bytes, fname);
+        })
+        .catch((err: any) => { setCloudErr(err.message); setSourceOpen(true); })
+        .finally(() => setCloudLoading(false));
+    };
+    chrome.storage.onChanged.addListener(onStorageChange);
+
+    return () => {
+      window.removeEventListener('message', onMsg);
+      chrome.storage.onChanged.removeListener(onStorageChange);
+    };
   }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { setArmedItem(null); setDrawingOpen(false); setSourceOpen(false); }
+      if (e.key === 'Escape') {
+        setArmedItem(null); setDrawingOpen(false);
+        if (cloudPickerActive) cancelCloudPicker();
+        setSourceOpen(false);
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -437,6 +477,22 @@ export default function SigningPage() {
     return url;
   }
 
+  function openCloudPicker(source: 'drive' | 'dropbox') {
+    setCloudPickerActive(true);
+    setCloudErr(null);
+    chrome.runtime.sendMessage({ type: 'OPEN_CLOUD_PICKER', source }, () => {
+      void chrome.runtime.lastError;
+    });
+  }
+
+  function cancelCloudPicker() {
+    setCloudPickerActive(false);
+    setCloudErr(null);
+    chrome.runtime.sendMessage({ type: 'CANCEL_CLOUD_PICKER' }, () => {
+      void chrome.runtime.lastError;
+    });
+  }
+
   async function fetchCloudPdf() {
     const raw = cloudUrl.trim();
     if (!raw) return;
@@ -545,14 +601,14 @@ export default function SigningPage() {
       {sourceOpen && (
         <div style={{ position:'fixed', inset:0, zIndex:200, background:'rgba(0,0,0,0.55)',
           backdropFilter:'blur(4px)', display:'flex', alignItems:'center', justifyContent:'center' }}
-          onClick={() => setSourceOpen(false)}>
+          onClick={() => { setSourceOpen(false); if (cloudPickerActive) cancelCloudPicker(); }}>
           <div style={{ background:C.bgElevated, borderRadius:16, padding:24, width:480,
             maxWidth:'94vw', border:`1px solid ${C.border}`, boxShadow:'0 24px 64px rgba(0,0,0,0.3)' }}
             onClick={(e) => e.stopPropagation()}>
 
             <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:16 }}>
               <h3 style={{ fontSize:16, fontWeight:700, color:C.fg, margin:0 }}>Open PDF</h3>
-              <button onClick={() => setSourceOpen(false)}
+              <button onClick={() => { setSourceOpen(false); if (cloudPickerActive) cancelCloudPicker(); }}
                 style={{ width:28, height:28, borderRadius:8, border:`1px solid ${C.border}`,
                   background:'transparent', color:C.fgMuted, cursor:'pointer',
                   display:'grid', placeItems:'center', fontSize:14 }}>✕</button>
@@ -593,45 +649,24 @@ export default function SigningPage() {
               </div>
             )}
 
-            {/* URL / Drive / Dropbox tabs */}
-            {(sourceTab==='url' || sourceTab==='drive' || sourceTab==='dropbox') && (
+            {/* URL tab — paste a direct link */}
+            {sourceTab==='url' && (
               <div>
-                {sourceTab==='drive' && (
-                  <div style={{ padding:'10px 12px', borderRadius:10, background:'#f0fdf4',
-                    border:'1px solid #bbf7d0', fontSize:12, color:'#166534', marginBottom:12 }}>
-                    <strong>How to share:</strong> Open in Google Drive → Share → "Anyone with the link" → Copy link, then paste below.
-                  </div>
-                )}
-                {sourceTab==='dropbox' && (
-                  <div style={{ padding:'10px 12px', borderRadius:10, background:'#eff6ff',
-                    border:'1px solid #bfdbfe', fontSize:12, color:'#1d4ed8', marginBottom:12 }}>
-                    <strong>How to share:</strong> Open in Dropbox → Share → Copy Link, then paste below.
-                  </div>
-                )}
-                {sourceTab==='url' && (
-                  <p style={{ fontSize:12, color:C.fgMuted, marginBottom:12 }}>
-                    Paste a direct link to any publicly accessible PDF.
-                  </p>
-                )}
-
+                <p style={{ fontSize:12, color:C.fgMuted, marginBottom:12 }}>
+                  Paste a direct link to any publicly accessible PDF.
+                </p>
                 <input type="url" value={cloudUrl}
                   onChange={(e) => { setCloudUrl(e.target.value); setCloudErr(null); }}
                   onKeyDown={(e) => { if (e.key==='Enter') fetchCloudPdf(); }}
-                  placeholder={
-                    sourceTab==='drive'   ? 'https://drive.google.com/file/d/…' :
-                    sourceTab==='dropbox' ? 'https://www.dropbox.com/s/…' :
-                                           'https://example.com/document.pdf'
-                  }
+                  placeholder="https://example.com/document.pdf"
                   style={{ width:'100%', height:40, padding:'0 12px', borderRadius:10,
                     border:`1px solid ${cloudErr?C.danger:C.border}`, background:C.bgInset,
                     fontSize:13, color:C.fg, boxSizing:'border-box', outline:'none',
                     display:'block', marginBottom:cloudErr?6:12 }}
                 />
-
                 {cloudErr && (
                   <p style={{ fontSize:12, color:C.danger, margin:'0 0 10px' }}>{cloudErr}</p>
                 )}
-
                 <button onClick={fetchCloudPdf}
                   disabled={!cloudUrl.trim() || cloudLoading}
                   style={{ width:'100%', height:40, borderRadius:10, border:'none',
@@ -640,12 +675,55 @@ export default function SigningPage() {
                     fontSize:13, fontWeight:600,
                     cursor: !cloudUrl.trim() ? 'not-allowed' : 'pointer',
                     opacity: cloudLoading ? 0.6 : 1 }}>
-                  {cloudLoading ? '⏳ Fetching PDF…' :
-                    sourceTab==='drive'   ? '🟢 Open from Google Drive' :
-                    sourceTab==='dropbox' ? '📦 Open from Dropbox' :
-                                           '🔗 Open PDF from URL'}
+                  {cloudLoading ? '⏳ Fetching PDF…' : '🔗 Open PDF from URL'}
                 </button>
               </div>
+            )}
+
+            {/* Drive / Dropbox tabs — open picker window */}
+            {(sourceTab==='drive' || sourceTab==='dropbox') && (
+              cloudPickerActive ? (
+                <div style={{ textAlign:'center', padding:'32px 16px' }}>
+                  <div style={{ fontSize:36, marginBottom:12 }}>⏳</div>
+                  <div style={{ fontSize:14, fontWeight:600, color:C.fg, marginBottom:8 }}>
+                    Waiting for file selection…
+                  </div>
+                  <div style={{ fontSize:12, color:C.fgMuted, marginBottom:24, lineHeight:1.5 }}>
+                    {sourceTab==='drive'
+                      ? 'In the Google Drive window, navigate to your PDF and click on it to open.'
+                      : 'In the Dropbox window, navigate to your PDF and click on it to open.'}
+                  </div>
+                  <button onClick={cancelCloudPicker}
+                    style={{ padding:'8px 20px', borderRadius:8, border:`1px solid ${C.border}`,
+                      background:'transparent', color:C.fgMuted, fontSize:13, cursor:'pointer' }}>
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <div>
+                  {sourceTab==='drive' && (
+                    <div style={{ padding:'10px 12px', borderRadius:10, background:'#f0fdf4',
+                      border:'1px solid #bbf7d0', fontSize:12, color:'#166534', marginBottom:16, lineHeight:1.5 }}>
+                      A Google Drive window will open. Navigate to your PDF and click it — the file will load automatically.
+                      <br/><strong>Note:</strong> PDF must be shared with "Anyone with the link" or be yours.
+                    </div>
+                  )}
+                  {sourceTab==='dropbox' && (
+                    <div style={{ padding:'10px 12px', borderRadius:10, background:'#eff6ff',
+                      border:'1px solid #bfdbfe', fontSize:12, color:'#1d4ed8', marginBottom:16, lineHeight:1.5 }}>
+                      A Dropbox window will open. Navigate to your PDF and click it — the file will load automatically.
+                    </div>
+                  )}
+                  {cloudErr && (
+                    <p style={{ fontSize:12, color:C.danger, margin:'0 0 12px' }}>{cloudErr}</p>
+                  )}
+                  <button onClick={() => openCloudPicker(sourceTab as 'drive'|'dropbox')}
+                    style={{ width:'100%', height:44, borderRadius:10, border:'none',
+                      background:C.brandGrad, color:'#fff', fontSize:14, fontWeight:600, cursor:'pointer' }}>
+                    {sourceTab==='drive' ? '🟢 Open Google Drive' : '📦 Open Dropbox'}
+                  </button>
+                </div>
+              )
             )}
           </div>
         </div>
